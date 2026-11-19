@@ -1,0 +1,47 @@
+name: probe
+
+# 0단계 접속 시험: 언론사 기사 페이지가 이 실행기에서 받아지는지 본다 (worker/probe.py).
+# 손으로만 돌린다. 결과는 Firestore probe/{실행 번호}에 남고, 로그에는 언론사 번호와 건수만 찍힌다.
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "시험할 언론사 번호 (예: 3,7). 비우면 전부"
+        type: string
+        default: ""
+
+concurrency:
+  group: probe
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write   # Google Cloud에 키 파일 없이 접속 (Workload Identity Federation)
+
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - run: pip install -r worker/requirements.txt
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: 접속 시험
+        working-directory: worker
+        run: python probe.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          ONLY: ${{ inputs.only }}
