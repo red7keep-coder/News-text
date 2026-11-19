@@ -88,21 +88,32 @@ def stage_of(rel, stages):
 
 # ── 목록 화면 ──────────────────────────────────────
 CSS = """
-:root{--bg:#F7F8FA;--card:#FFF;--ink:#111827;--sub:#6B7280;--line:#E5E7EB;--new:#DC2626;--acc:#2563EB}
-@media (prefers-color-scheme:dark){:root{--bg:#0B0F14;--card:#151A21;--ink:#E5E7EB;--sub:#9CA3AF;--line:#262C35;--acc:#60A5FA}}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 -apple-system,'Apple SD Gothic Neo','Noto Sans KR',sans-serif}
-main{max-width:720px;margin:0 auto;padding:16px}
-h1{font-size:20px;margin:4px 0 12px}h2{font-size:16px;margin:24px 0 8px}
-input{width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--card);color:var(--ink);font-size:15px}
-.box{background:var(--card);border:1px solid var(--line);border-radius:12px;margin:8px 0;overflow:hidden}
-.feat{padding:10px 14px;border-bottom:1px solid var(--line)}.feat b{display:block}.feat small{color:var(--sub)}
-a.row{display:flex;gap:10px;align-items:center;padding:12px 14px;min-height:48px;color:inherit;text-decoration:none;border-top:1px solid var(--line)}
-a.row:first-of-type{border-top:0}a.row:active{background:var(--line)}
-.t{flex:1;min-width:0}.t small{display:block;color:var(--sub);font-size:12px;overflow-wrap:anywhere}
-.n{background:var(--new);color:#fff;font-size:11px;font-weight:700;border-radius:4px;padding:1px 6px}
-.note{color:var(--new);font-size:12px}.when{color:var(--sub);font-size:12px;white-space:nowrap}
-details>summary{cursor:pointer;padding:12px 14px;font-weight:600;list-style:none}details>summary::after{content:' ▾';color:var(--sub)}
-.empty{color:var(--sub);padding:12px 14px}
+:root{--bg:#FFFFFF;--line:#E2E8F0;--line-soft:#F3F3F3;--text:#111;--text-2:#333;--sub:#6B7280;--muted:#9CA3AF;
+--font:'Noto Sans KR',sans-serif;--num:'Inter','Noto Sans KR',sans-serif}
+*{box-sizing:border-box}html,body{margin:0;background:var(--bg)}
+body{color:var(--text-2);font-family:var(--font);font-size:15px;line-height:23px;font-weight:400;word-break:keep-all;overflow-wrap:anywhere}
+main{max-width:720px;margin:0 auto;padding:16px 16px 40px}
+@media (max-width:680px){main{padding-left:14px;padding-right:14px}}
+h1{font-size:19px;line-height:29px;font-weight:700;color:var(--text);margin:4px 0 12px}
+h2{font-size:15px;line-height:23px;font-weight:700;color:var(--text);margin:24px 0 8px;display:flex;align-items:center;gap:5px}
+input{width:100%;padding:9px 12px;border:1px solid var(--line);border-radius:4px;background:var(--bg);color:var(--text-2);
+font-family:var(--font);font-size:15px;line-height:23px}
+.box{background:var(--bg);border:1px solid var(--line);border-radius:10px;margin:8px 0;overflow:hidden}
+.feat{padding:10px 16px;border-bottom:1px solid var(--line)}
+.feat b{display:block;font-size:15px;line-height:23px;font-weight:700;color:var(--text)}
+.feat small{display:block;color:var(--sub);font-size:13px;line-height:19px}
+a.row{display:flex;gap:10px;align-items:center;padding:12px 16px;min-height:48px;color:inherit;text-decoration:none;border-top:1px solid var(--line-soft)}
+a.row:first-of-type{border-top:0}a.row:active{background:var(--line-soft)}
+.t{flex:1;min-width:0;color:var(--text);font-weight:500}
+.t small{display:block;color:var(--sub);font-size:13px;line-height:19px;font-weight:400}
+.n{flex:none;background:#B91C1C;color:#FFFFFF;font-family:var(--num);font-size:12px;line-height:12px;font-weight:700;border-radius:3px;padding:1px 4px}
+.note{display:block;color:var(--text-2);font-size:13px;line-height:19px;font-weight:400}
+.when{color:var(--sub);font-size:13px;line-height:19px;white-space:nowrap;font-family:var(--num);font-variant-numeric:tabular-nums}
+details>summary{cursor:pointer;padding:12px 16px;font-size:14px;line-height:20px;font-weight:700;color:var(--text-2);list-style:none}
+details>summary::-webkit-details-marker{display:none}
+details>summary::after{content:' ▾';color:var(--sub)}details[open]>summary::after{content:' ▴'}
+.empty{color:var(--muted);padding:12px 16px;font-size:14px;line-height:20px}
+.cnt{font-family:var(--num);font-variant-numeric:tabular-nums;color:var(--sub);font-weight:400}
 """
 
 
@@ -112,7 +123,8 @@ def when(ts):
         return f"{max(1, int(d // 60))}분 전"
     if d < 86400:
         return f"{int(d // 3600)}시간 전"
-    return time.strftime("%m.%d", time.localtime(ts))
+    t = time.localtime(ts)
+    return f"{t.tm_mon}.{t.tm_mday}"
 
 
 def row(rel, mtime, new=None):
@@ -120,7 +132,7 @@ def row(rel, mtime, new=None):
     badge = '<span class="n">N</span>' if new is not None else ""
     note = f'<span class="note">{html.escape(new.get("note", ""))}</span>' if new and new.get("note") else ""
     return (f'<a class="row" href="/m/{quote(rel)}" data-k="{html.escape(rel.lower() + " " + t.lower())}">{badge}'
-            f'<span class="t">{t} {note}<small>{html.escape(rel)}</small></span><span class="when">{when(mtime)}</span></a>')
+            f'<span class="t">{t}{note}<small>{html.escape(rel)}</small></span><span class="when">{when(mtime)}</span></a>')
 
 
 def index_page():
@@ -135,38 +147,41 @@ def index_page():
         (plan[st[1]] if st and st[0] == "plan" else live[st[1]] if st else archive).append((rel, mt))
 
     h = [f"<!doctype html><html lang=ko><meta charset=utf-8><meta name=viewport content='width=device-width,initial-scale=1'>"
-         f"<title>목업 목록</title><style>{CSS}</style><main><h1>목업 목록</h1>"
+         f"<title>목업 목록</title><link rel=preconnect href='https://fonts.googleapis.com'><link rel=preconnect href='https://fonts.gstatic.com' crossorigin>"
+         f"<link href='https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Noto+Sans+KR:wght@400;500;700;900&display=swap' rel=stylesheet>"
+         f"<style>{CSS}</style><main><h1>목업 목록</h1>"
          "<input id=q placeholder='이름으로 찾기' oninput=\"for(const a of document.querySelectorAll('a.row'))"
          "a.style.display=a.dataset.k.includes(this.value.toLowerCase())?'':'none'\">"]
 
     fresh = [(r, m) for r, m in items if r in new]
     if fresh:
-        h.append(f"<h2>N 새로 바뀐 목업 · {len(fresh)}</h2><div class=box>")
+        h.append(f"<h2><span class=n>N</span>새로 바뀐 목업 <span class=cnt>{len(fresh)}</span></h2><div class=box>")
         h += [row(r, m, new[r]) for r, m in fresh]
         h.append("</div>")
 
     h.append("<h2>발행 예정</h2>")
     for i, s in enumerate(stages.get("plan", [])):
-        rows = "".join(row(r, m, new.get(r)) for r, m in plan[i]) or "<div class=empty>목업 파일 없음</div>"
+        rows = "".join(row(r, m, new.get(r)) for r, m in plan[i]) or "<div class=empty>목업 파일이 아직 없습니다</div>"
         h.append(f"<div class=box><div class=feat><b>{html.escape(s.get('name', ''))}</b>"
-                 f"<small>남은 일 · {html.escape(s.get('todo', ''))}</small></div>{rows}</div>")
+                 f"<small>남은 일 : {html.escape(s.get('todo', ''))}</small></div>{rows}</div>")
     if not stages.get("plan"):
         h.append("<div class='box empty'>없음</div>")
 
     h.append("<h2>발행된 화면</h2>")
     for i, s in enumerate(stages.get("live", [])):
-        h.append(f"<details class=box><summary>{html.escape(s.get('name', ''))} · {len(live[i])}</summary>"
+        h.append(f"<details class=box><summary>{html.escape(s.get('name', ''))} <span class=cnt>{len(live[i])}</span></summary>"
                  + "".join(row(r, m, new.get(r)) for r, m in live[i]) + "</details>")
     if not stages.get("live"):
         h.append("<div class='box empty'>없음</div>")
 
-    h.append(f"<h2>자동 보관</h2><details class=box><summary>어느 표에도 없는 목업 · {len(archive)}</summary>"
+    h.append(f"<h2>자동 보관</h2><details class=box><summary>어느 표에도 없는 목업 <span class=cnt>{len(archive)}</span></summary>"
              + "".join(row(r, m, new.get(r)) for r, m in archive) + "</details></main>")
     return "".join(h)
 
 
-BACK = ("<a href='/' style='position:fixed;right:12px;bottom:12px;z-index:99999;background:#111827;color:#fff;"
-        "font:600 13px sans-serif;padding:10px 14px;border-radius:10px;text-decoration:none;opacity:.85'>목록</a>")
+BACK = ("<a href='/' style='position:fixed;right:12px;bottom:12px;z-index:99999;background:#FFFFFF;color:#333;"
+        "border:1px solid #E2E8F0;font:700 14px/20px \"Noto Sans KR\",sans-serif;padding:8px 14px;border-radius:4px;"
+        "text-decoration:none'>목록</a>")
 
 
 # ── 서버 ────────────────────────────────────────────
