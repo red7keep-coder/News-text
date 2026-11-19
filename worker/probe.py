@@ -357,7 +357,8 @@ def main():
     db = firestore.Client(project=project)
     only = {int(x) for x in os.environ.get("ONLY", "").replace(",", " ").split() if x.isdigit()}
     outlets = [d.to_dict() for d in db.collection("outlets").stream()]
-    outlets = sorted((o for o in outlets if o.get("enabled", True) and (not only or o["no"] in only)),
+    # 번호를 지정하면 꺼 둔 언론사도 시험한다 (보류한 곳을 다시 확인할 때)
+    outlets = sorted((o for o in outlets if (o["no"] in only) if only else o.get("enabled", True)),
                      key=lambda o: o["no"])
     log(f"언론사 {len(outlets)}곳 시험 시작")
     run_id = os.environ.get("GITHUB_RUN_ID") or datetime.now(timezone.utc).strftime("local-%Y%m%d%H%M%S")
