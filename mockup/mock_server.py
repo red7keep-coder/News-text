@@ -91,7 +91,7 @@ CSS = """
 :root{--bg:#FFFFFF;--line:#E2E8F0;--line-soft:#F3F3F3;--text:#111;--text-2:#333;--sub:#6B7280;--muted:#9CA3AF;
 --font:'Noto Sans KR',sans-serif;--num:'Inter','Noto Sans KR',sans-serif}
 *{box-sizing:border-box}html,body{margin:0;background:var(--bg)}
-body{color:var(--text-2);font-family:var(--font);font-size:15px;line-height:23px;font-weight:400;word-break:keep-all;overflow-wrap:anywhere}
+body{color:var(--text-2);font-family:var(--font);font-size:15px;line-height:23px;font-weight:400;word-break:keep-all;overflow-wrap:break-word}
 main{max-width:720px;margin:0 auto;padding:16px 16px 40px}
 @media (max-width:680px){main{padding-left:14px;padding-right:14px}}
 h1{font-size:19px;line-height:29px;font-weight:700;color:var(--text);margin:4px 0 12px}
