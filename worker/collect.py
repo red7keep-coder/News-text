@@ -13,6 +13,7 @@ import hashlib
 import os
 import re
 from datetime import datetime, timedelta, timezone
+from difflib import SequenceMatcher
 
 import llm
 import net
@@ -158,23 +159,30 @@ def pick(cands, stats):
     return kept
 
 
-def choose(kept, limit):
-    """여러 언론사가 다룬 사건부터, 사건마다 서로 다른 언론사 PER_EVENT곳까지. 남으면 한 곳만 쓴 사건을 언론사 돌아가며."""
+def choose(kept, limit, same=None):
+    """독립 출처 여러 곳이 다룬 사건부터, 사건마다 서로 다른 출처 PER_EVENT곳까지. 남으면 한 출처만 쓴 사건을 언론사 돌아가며."""
     groups = {}
     for c in kept:
         g = groups.setdefault(norm_label(c["event"]), {})
         g.setdefault(c["no"], c)                      # 한 사건에서 언론사당 한 건
-    multi = sorted((g for g in groups.values() if len(g) >= 2), key=lambda g: -len(g))
+    picks = {}                                        # 사건마다 출처당 가장 최근 한 건
+    for key, g in groups.items():
+        cs = sorted(g.values(), key=lambda c: -c["ts"])
+        by_src = {}
+        for c, s in zip(cs, source_ids([(c["no"], c["title"]) for c in cs], same or {})):
+            by_src.setdefault(s, c)
+        picks[key] = list(by_src.values())
+    multi = sorted((k for k in groups if len(picks[k]) >= 2), key=lambda k: -len(picks[k]))
     chosen = []
-    for g in multi:
-        for c in sorted(g.values(), key=lambda c: -c["ts"])[:PER_EVENT]:
+    for k in multi:
+        for c in picks[k][:PER_EVENT]:
             if len(chosen) >= limit:
                 return chosen, len(multi)
             chosen.append(c)
     singles = {}
-    for g in groups.values():
-        if len(g) == 1:
-            c = next(iter(g.values()))
+    for k in groups:
+        if len(picks[k]) == 1:
+            c = picks[k][0]
             singles.setdefault(c["no"], []).append(c)
     for v in singles.values():
         v.sort(key=lambda c: -c["ts"])
@@ -300,11 +308,44 @@ def extract_facts(chosen, texts, stats):
 # ---------- ⑤ 사건 ----------
 
 def num_key(n):
-    return (re.sub(r"[\s,]", "", n["value"]), n["unit"].strip())
+    """값과 단위를 붙여 띄어쓰기 · 쉼표를 뺀다. '1조 달러' · '1조달러' · ('1조', '달러')를 같은 숫자로 본다."""
+    return re.sub(r"[\s,]", "", f"{n['value']}{n['unit']}")
 
 
-def build_events(arts, stats):
-    """arts: [{id, no, url, title, publishedAt, facts}] → 사건 목록."""
+# ---------- 서로 다른 출처 세기 ----------
+# 같은 기사를 받아 실은 언론사를 두 곳으로 세면 '두 곳 이상' 확인이 무너진다 (11-19: 파이낸셜뉴스가 뉴시스 기사를 그대로 실음).
+# 두 가지로 묶는다: outlets의 sameSource(같은 출처로 볼 언론사 번호), 그리고 제목이 거의 같은 기사.
+SAME_TITLE = 0.85          # 제목 유사도가 이 이상이면 같은 기사를 받아 실은 것으로 본다
+
+
+def _title_key(t):
+    return re.sub(r"[^0-9A-Za-z가-힣]", "", re.sub(r"\[[^\]]*\]", "", t or ""))
+
+
+def source_ids(items, same):
+    """items: [(언론사 번호, 제목)], same: {번호: 같은 출처 번호}. 항목마다 '독립 출처' 번호를 돌려준다."""
+    parent = list(range(len(items)))
+
+    def find(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    keys = [_title_key(t) for _, t in items]
+    for i in range(len(items)):
+        for j in range(i):
+            a, b = items[i][0], items[j][0]
+            if (a == b or same.get(a, a) == same.get(b, b)
+                    or (keys[i] and keys[j] and SequenceMatcher(None, keys[i], keys[j]).ratio() >= SAME_TITLE)):
+                parent[find(i)] = find(j)
+    return [find(i) for i in range(len(items))]
+
+
+def build_events(arts, stats, same=None):
+    """arts: [{id, no, url, title, publishedAt, facts}] → 사건 목록.
+    확인 수(sourceCount)는 언론사 수가 아니라 독립 출처 수다 (source_ids). 숫자 일치도 독립 출처 두 곳 이상이어야 한다."""
+    same = same or {}
     fidx, lines = {}, []
     for a in arts:
         for j, f in enumerate(a.get("facts") or []):
@@ -329,21 +370,28 @@ def build_events(arts, stats):
     events = []
     for title, cat, ids in groups:
         outlets = sorted({fidx[x][0]["no"] for x in ids})
+        art_list = list({fidx[x][0]["id"]: fidx[x][0] for x in ids}.values())
+        src = dict(zip((a["id"] for a in art_list), source_ids([(a["no"], a.get("title", "")) for a in art_list], same)))
         nums = {}
         for x in ids:
             a, f = fidx[x]
             for n in f["numbers"]:
                 k = num_key(n)
-                d = nums.setdefault(k, {"name": n["name"], "value": n["value"], "unit": n["unit"], "kind": n["kind"], "outlets": set()})
+                d = nums.setdefault(k, {"name": n["name"], "value": n["value"], "unit": n["unit"], "kind": n["kind"],
+                                        "outlets": set(), "src": set()})
                 d["outlets"].add(a["no"])
-        numbers = [dict(d, outlets=sorted(d["outlets"]), agreed=len(d["outlets"]) >= 2) for d in nums.values()]
+                d["src"].add(src[a["id"]])
+        numbers = [dict({k: v for k, v in d.items() if k != "src"}, outlets=sorted(d["outlets"]),
+                        sources=len(d["src"]), agreed=len(d["src"]) >= 2) for d in nums.values()]
+        source_count = len(set(src.values()))
         dirs = [fidx[x][1]["direction"] for x in ids]
         sources = {}
         for x in ids:
             a = fidx[x][0]
             sources[a["id"]] = {"no": a["no"], "url": a["url"], "title": a["title"], "publishedAt": a.get("publishedAt")}
         events.append({
-            "title": title, "cat": cat, "outlets": outlets, "outletCount": len(outlets), "single": len(outlets) < 2,
+            "title": title, "cat": cat, "outlets": outlets, "outletCount": len(outlets),
+            "sourceCount": source_count, "single": source_count < 2,
             "facts": [dict(fidx[x][1], no=fidx[x][0]["no"], article=fidx[x][0]["id"]) for x in ids],
             "numbers": numbers, "agreedNumbers": sum(1 for n in numbers if n["agreed"]),
             "direction": ("up" if dirs.count("up") > dirs.count("down") else
@@ -351,7 +399,7 @@ def build_events(arts, stats):
             "stage": "discussing" if all(fidx[x][1]["stage"] == "discussing" for x in ids) else "confirmed",
             "sources": list(sources.values()),
         })
-    events.sort(key=lambda e: (-e["outletCount"], -len(e["facts"])))
+    events.sort(key=lambda e: (-e["sourceCount"], -e["outletCount"], -len(e["facts"])))
     stats["events"] = len(events)
     stats["multiEvents"] = sum(1 for e in events if not e["single"])
     return events
@@ -372,6 +420,7 @@ def main():
         outlets = sorted((d.to_dict() for d in db.collection("outlets").stream() if d.to_dict().get("enabled", True)),
                          key=lambda o: o["no"])
         hosts = {o["no"]: o["host"] for o in outlets}
+        same = {o["no"]: int(o["sameSource"]) for o in outlets if o.get("sameSource")}   # 같은 출처로 셀 언론사
         states = {}
         for o in outlets:
             s = db.collection("outlet_state").document(f"{o['no']:02d}").get()
@@ -394,7 +443,7 @@ def main():
         # ② 고르기
         stats["stage"] = "고르기"
         kept = pick(cands, stats)
-        chosen, multi = choose(kept, MAX_FETCH)
+        chosen, multi = choose(kept, MAX_FETCH, same)
         stats["chosen"], stats["multiGroups"] = len(chosen), multi
         log(f"② 고르기: {len(kept):,}건 남김, 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
         # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게)
@@ -431,7 +480,7 @@ def main():
         since = now - timedelta(hours=EVENT_HOURS)
         arts = [dict(d.to_dict(), id=d.id) for d in
                 db.collection("articles").where(filter=FieldFilter("extractedAt", ">=", since)).stream()]
-        events = build_events(arts, stats)
+        events = build_events(arts, stats, same)
         db.collection("eventsets").document(str(run_id)).set({
             "createdAt": now, "since": since, "articles": len(arts), "events": events,
             "edition": now.astimezone(KST).strftime("%Y-%m-%d %H시"),

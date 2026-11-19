@@ -107,7 +107,8 @@ def looks_article(url, host):
     if re.search(r"\d{5,}", path) or len(path.strip("/").split("/")) >= 3:
         return True
     # 번호가 쿼리에 있는 CMS (예: articleView.html?idxno=…). 섹션 번호(cid · sid)는 기사로 보지 않는다
-    return bool(re.search(r"(?:^|&)(?:idxno|aid|art_?id|article_?id|news_?id|no|id)=\d{5,}", p.query, re.I))
+    # 번호 앞에 영문자 한 글자가 붙는 곳도 있다 (예: news_id=N1008854079, 11-19 SBS)
+    return bool(re.search(r"(?:^|&)(?:idxno|aid|art_?id|article_?id|news_?id|no|id)=[A-Z]?\d{5,}", p.query, re.I))
 
 
 # ---------- 목록(사이트맵 · RSS) ----------
@@ -175,10 +176,12 @@ def parse_feed(body):
 
 
 def pick_subs(subs):
-    """사이트맵 목록에서 기사 쪽 하위 사이트맵을 앞으로 (최신 순은 유지)."""
-    good = [u for u in subs if re.search(r"news|article|daily|today|latest|all", u, re.I)
-            and not re.search(r"image|photo|video|sports|section|category|tag", u, re.I)]
-    rest = [u for u in subs if u not in good and not re.search(r"image|photo|video", u, re.I)]
+    """사이트맵 목록에서 기사 쪽 하위 사이트맵을 앞으로 (최신 순은 유지).
+    주소 전체가 아니라 경로만 본다: 사이트 이름에 news가 들어가면 모든 하위 목록이 '기사 쪽'으로 보였다 (11-19 뉴스핌)."""
+    path = lambda u: urlsplit(u).path
+    good = [u for u in subs if re.search(r"news|article|daily|today|latest|all", path(u), re.I)
+            and not re.search(r"image|photo|video|sports|section|category|tag|local", path(u), re.I)]
+    rest = [u for u in subs if u not in good and not re.search(r"image|photo|video", path(u), re.I)]
     return good + rest
 
 
