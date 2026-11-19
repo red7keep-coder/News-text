@@ -51,3 +51,13 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_MODELS: ${{ vars.GEMINI_MODELS }}
           MAX_FETCH: ${{ inputs.max_fetch }}
+
+      # 2단계 글쓰기 (worker/write.py): 방금 만든 사건 목록에서 07:00 두 편 · 16:30 세 편. 초안은 Firestore posts에만
+      - name: 글쓰기
+        working-directory: worker
+        run: python write.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_WRITE_MODELS: ${{ vars.GEMINI_WRITE_MODELS }}

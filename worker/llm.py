@@ -33,9 +33,9 @@ def key():
     return os.environ.get("GEMINI_API_KEY", "").strip()
 
 
-def _wait():
+def _wait(gap=GAP):
     global _last
-    left = GAP - (time.monotonic() - _last)
+    left = gap - (time.monotonic() - _last)
     if _last and left > 0:
         time.sleep(left)
     _last = time.monotonic()
@@ -60,12 +60,12 @@ def extract_json(text):
     return json.loads(text[min(starts):max(text.rfind("}"), text.rfind("]")) + 1])
 
 
-def _call(model, prompt, max_out):
+def _call(model, prompt, max_out, gap=GAP, temperature=0):
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-        "generationConfig": {"temperature": 0, "responseMimeType": "application/json", "maxOutputTokens": max_out},
+        "generationConfig": {"temperature": temperature, "responseMimeType": "application/json", "maxOutputTokens": max_out},
     }
-    _wait()
+    _wait(gap)
     stats["calls"] += 1
     stats["byModel"][model] = stats["byModel"].get(model, 0) + 1
     try:
@@ -85,24 +85,26 @@ def _call(model, prompt, max_out):
         return 200, "", ""
 
 
-def generate_json(prompt, max_out=8192):
-    """prompt → 파싱된 JSON. 안 되면 LLMError."""
+def generate_json(prompt, max_out=8192, models=None, gap=GAP, temperature=0, attempts=ATTEMPTS):
+    """prompt → 파싱된 JSON. 안 되면 LLMError.
+    models · gap: 글쓰기(write.py)는 Hydrogen → 3.6 Flash(분당 5회라 13초 간격)를 따로 넘긴다."""
     if not key():
         raise LLMError("GEMINI_API_KEY 없음")
-    for i, model in enumerate(MODELS):
-        has_next = i + 1 < len(MODELS)
+    models = models or MODELS
+    for i, model in enumerate(models):
+        has_next = i + 1 < len(models)
         try:
-            return _with_model(model, prompt, max_out, has_next)
+            return _with_model(model, prompt, max_out, has_next, gap, temperature, attempts)
         except _Switch as e:
             _count_error(f"{model} → 예비 ({e})")
             continue
     raise LLMError("모든 모델 실패")
 
 
-def _with_model(model, prompt, max_out, has_next):
+def _with_model(model, prompt, max_out, has_next, gap=GAP, temperature=0, attempts=ATTEMPTS):
     last = ""
-    for attempt in range(1, ATTEMPTS + 1):
-        code, text, finish = _call(model, prompt, max_out)
+    for attempt in range(1, attempts + 1):
+        code, text, finish = _call(model, prompt, max_out, gap, temperature)
         if code == 200:
             try:
                 return extract_json(text)
@@ -120,4 +122,4 @@ def _with_model(model, prompt, max_out, has_next):
         if code == 404:
             raise LLMError(f"{last}: 모델 이름 확인 필요")
         time.sleep(60 if code == 429 else 15 * attempt)
-    raise LLMError(f"{ATTEMPTS}회 실패({last})")
+    raise LLMError(f"{attempts}회 실패({last})")
