@@ -173,7 +173,8 @@ def _generate(prompt):
         try:
             return llm.generate_json(prompt, max_out=16384, models=WRITE_MODELS, gap=WRITE_GAP, temperature=0.4, attempts=3)
         except llm.LLMError as e:
-            busy = "503" in str(e) or "접속 실패" in str(e)
+            # 429도 기다린다: Hydrogen이 503이면 3.6 Flash로 넘어가는데, 그쪽 한도(429)에 걸리면 쉬었다가 Hydrogen부터 다시 (11-19)
+            busy = "503" in str(e) or "접속 실패" in str(e) or "429" in str(e)
             if not busy or round_ == BUSY_ROUNDS:
                 raise
             log(f"   Gemini 혼잡, {BUSY_WAIT // 60}분 쉬고 다시 ({round_ + 1}/{BUSY_ROUNDS})")
