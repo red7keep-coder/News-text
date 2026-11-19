@@ -1,0 +1,53 @@
+name: collect
+
+# 1단계 수집 (worker/collect.py): 목록 → 고르기 → 받기 → 사실 뽑기 → 사건 묶기. 글은 쓰지 않는다.
+# 결과는 Firestore(articles · eventsets · runs)에만 남고, 로그에는 건수만 찍힌다.
+# 예약: 07:00 KST(밤사이 뉴스) · 16:30 KST(장 마감 뒤). GitHub 예약 실행은 수십 분 늦을 수 있다.
+on:
+  schedule:
+    - cron: "0 22 * * *"    # 07:00 KST
+    - cron: "30 7 * * *"    # 16:30 KST
+  workflow_dispatch:
+    inputs:
+      max_fetch:
+        description: "본문을 받을 기사 수 (비우면 50)"
+        type: string
+        default: ""
+
+concurrency:
+  group: outlets      # probe와 같은 줄: 언론사에 두 실행이 겹쳐 요청하지 않게
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - run: pip install -r worker/requirements.txt
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: 수집
+        working-directory: worker
+        run: python collect.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODELS: ${{ vars.GEMINI_MODELS }}
+          MAX_FETCH: ${{ inputs.max_fetch }}

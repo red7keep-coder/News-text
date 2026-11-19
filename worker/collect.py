@@ -1,0 +1,455 @@
+"""1단계 수집: 목록 → 고르기 → 받기 → 사실 뽑기 → 사건 묶기. 글은 아직 쓰지 않는다.
+
+  ① 목록    켜 둔 언론사의 자체 사이트맵 · RSS에서 지난 실행 이후 새 기사(주소 · 제목 · 시각)
+  ② 고르기  제목만 보고 시장 · 업종 · 기업 · 경제 정책 기사를 고르고 같은 사건끼리 이름을 맞춘다 (Gemini lite)
+  ③ 받기    고른 기사 본문을 받는다 (실행당 MAX_FETCH건, 여러 곳이 다룬 사건 먼저). 본문은 메모리에서만
+  ④ 사실    기사 몇 건씩 묶어 사실(누가 · 언제 · 무엇을 · 숫자 · 짧은 발언)을 뽑는다 (Gemini lite)
+  ⑤ 사건    지난 36시간의 사실을 사건으로 묶고, 몇 곳이 썼는지 · 숫자가 두 곳 이상에서 맞는지 센다 (Gemini lite)
+
+저장(Firestore, 비공개): articles · eventsets · runs · outlet_state, outlets.feed
+공개 로그: 건수 · 글자 수 · 호출 수만. 언론사 이름 · 주소 · 제목 · 본문 · AI 입출력은 찍지 않는다.
+"""
+import hashlib
+import os
+import re
+from datetime import datetime, timedelta, timezone
+
+import llm
+import net
+
+KST = timezone(timedelta(hours=9))
+MAX_FETCH = int(os.environ.get("MAX_FETCH") or 50)     # 실행당 본문을 받을 기사 수 (하루 두 번 → 100건)
+FRESH_HOURS = 36           # 이보다 오래된 목록 항목은 보지 않는다
+EVENT_HOURS = 36           # 사건 묶기에 넣을 사실의 기간
+SEEN_CAP = 5000            # 언론사마다 기억할 '이미 본 기사' 수
+TITLE_CHUNK = 1500         # 고르기 한 번에 넣을 제목 수
+PER_EVENT = 3              # 한 사건에서 본문을 받을 최대 언론사 수
+FACT_BATCH_N = 5           # 사실 뽑기 한 번에 넣을 기사 수
+FACT_BATCH_CHARS = 40_000  # 사실 뽑기 한 번에 넣을 본문 글자 수 (기사를 자르지 않고 묶음을 나눈다)
+
+CATEGORIES = ["RATES_FED", "INFLATION", "GROWTH_JOBS", "TARIFF_TRADE", "GEOPOLITICS", "OIL_ENERGY", "AI_CAPEX",
+              "EARNINGS", "CORP_EVENT", "CREDIT_BANKS", "MARKET_STRUCTURE", "REGULATION", "FISCAL_POLITICS",
+              "FX_GLOBAL", "CRYPTO", "REAL_ESTATE", "OTHER"]   # 유튜브 수집기 · 블로그와 같은 분류표 (데이터-설계.md)
+CAT_TEXT = ", ".join(CATEGORIES)
+
+PICK_PROMPT = """아래는 국내 언론사 기사 제목 목록입니다. 한 줄 형식: 번호|언론사번호|제목
+주식 투자 블로그의 사건별 글 재료로 쓸 기사만 고르세요.
+
+고르는 것: 국내 증시(코스피 · 코스닥)와 수급, 업종 · 산업 동향, 기업(실적 · 공시 · 투자 · 인수합병 · 신사업 · 소송),
+경제 정책 · 규제 · 세제, 환율 · 금리 · 물가 · 경기지표, 해외 사건 중 국내 시장이나 기업에 영향이 드러나는 것.
+빼는 것: 스포츠, 연예, 사건사고, 생활 · 건강, 시장 영향이 드러나지 않는 일반 정치, 인사 · 부고 · 동정, 행사 홍보,
+사진 · 영상 안내, 칼럼 · 사설 · 기자수첩, 종목 추천 나열, 광고성 기사. 애매하면 빼세요.
+
+고른 기사마다 event에 그 기사가 다루는 사건 이름을 붙이세요 (명사구 3 ~ 8단어, 회사 · 기관 이름이 있으면 넣기).
+다른 언론사가 같은 사건을 썼으면 반드시 똑같은 event 이름을 쓰세요.
+cat은 다음 분류 코드 중 하나: {cats}
+
+JSON만 답하세요: {{"keep":[{{"i":번호,"event":"사건 이름","cat":"코드"}}]}}
+
+목록:
+{lines}
+"""
+
+FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내부 재료이며, 기사 문장을 옮기면 안 됩니다.
+
+뽑는 것: 누가 · 언제 · 무엇을 했나, 숫자(발표치 · 예상치 · 금액 · 비율 · 날짜), 누가 말했는지 분명한 짧은 발언(한 문장 이하),
+그 사실의 원문 출처(공시 · 보도자료 · 정부 발표 · 통계)가 무엇인지.
+뽑지 않는 것: 기자의 해석 · 전망 · 평가 · 비유, 증권사 연구원 · 전문가의 견해(짧은 발언 하나만 quote로 가능),
+사진 · 그래프 · 표 설명, 기사에 없는 내용.
+
+규칙:
+- what은 사실 하나를 당신의 말로 새로 쓴 한 문장(60자 안팎). 기사 문장 · 제목을 그대로 쓰거나 어순만 바꾸지 마세요.
+- "검토 중 · 추진 · 논의" 같은 아직 정해지지 않은 사실도 넣고 stage를 discussing으로 적으세요.
+- direction은 그 사실이 관련 종목 · 업종 · 자산 가격에 주는 방향(기사에 드러난 대로) up / down / neutral. 모르면 neutral.
+- 매수 · 매도를 권하는 말을 만들지 마세요.
+- 숫자는 기사에 적힌 값 그대로(단위 포함). 계산하거나 반올림하지 마세요.
+- 기사 하나에 사실 1 ~ 8개. 사실이 없는 기사(칼럼 · 목록 기사 등)는 facts를 빈 배열로.
+- cat은 다음 분류 코드 중 하나: {cats}
+
+JSON만 답하세요:
+{{"articles":[{{"id":"기사 id","facts":[{{"what":"","who":"","when":"YYYY-MM-DD 또는 빈 값",
+"numbers":[{{"name":"","value":"","unit":"","kind":"발표|예상|기타"}}],
+"quote":{{"speaker":"","text":""}} 또는 null,
+"stocks":[{{"name":"","code":"6자리 종목코드 또는 빈 값"}}],
+"sector":"","cat":"코드","direction":"up|down|neutral","stage":"confirmed|discussing",
+"origin":"공시|보도자료|정부 발표|통계|없음"}}]}}]}}
+
+기사들:
+{articles}
+"""
+
+EVENTS_PROMPT = """아래는 여러 언론사 기사에서 뽑은 사실 목록입니다. 한 줄 형식: 사실id|언론사번호|분류|내용
+같은 사건을 다룬 사실끼리 묶으세요. 같은 회사의 같은 발표 · 같은 정책 · 같은 지표 발표면 같은 사건입니다.
+주제가 비슷해도 다른 회사 · 다른 발표면 다른 사건입니다.
+모든 사실id는 정확히 한 사건에 들어가야 합니다 (사실 하나뿐인 사건도 됩니다).
+사건마다 title을 새로 쓴 한 문장(40자 안팎)으로, cat을 분류 코드({cats}) 중 하나로 붙이세요.
+
+JSON만 답하세요: {{"events":[{{"title":"","cat":"코드","facts":["사실id"]}}]}}
+
+사실 목록:
+{lines}
+"""
+
+
+def log(msg):
+    print(msg, flush=True)
+
+
+def aid(url):
+    return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
+
+
+def norm_label(s):
+    return re.sub(r"[\s·,.'\"“”‘’]+", "", (s or "").lower())
+
+
+# ---------- ① 목록 ----------
+
+def list_new(outlets, states, now, stats):
+    """새 기사 후보 [{id, no, url, title, ts}]와 언론사별 새로 본 id."""
+    cands, new_ids, feeds = [], {}, {}
+    fresh_after = (now - timedelta(hours=FRESH_HOURS)).timestamp()
+    for o in outlets:
+        notes = []
+        seen = set(states.get(o["no"], {}).get("seen", []))
+        try:
+            feed, items = net.discover(o["host"], notes, override=o.get("feeds"), cached=o.get("feed"), need_title=True)
+        except net.Blocked:
+            stats["blockedList"].append(o["no"])
+            continue
+        except Exception as e:        # 한 곳의 오류로 전체를 멈추지 않는다
+            stats["errorList"][f"{o['no']:02d}"] = type(e).__name__
+            continue
+        if not feed:
+            stats["noFeed"].append(o["no"])
+            continue
+        if feed != o.get("feed"):
+            feeds[o["no"]] = feed
+        got = 0
+        for t, url, title in items:
+            i = aid(url)
+            if i in seen or (t and t < fresh_after):
+                continue
+            cands.append({"id": i, "no": o["no"], "url": url, "title": title[:200], "ts": t})
+            new_ids.setdefault(o["no"], []).append(i)
+            got += 1
+        stats["listed"][f"{o['no']:02d}"] = got
+    return cands, new_ids, feeds
+
+
+# ---------- ② 고르기 ----------
+
+def pick(cands, stats):
+    """고른 후보에 event · cat을 붙여 돌려준다."""
+    kept = []
+    for s in range(0, len(cands), TITLE_CHUNK):
+        chunk = cands[s:s + TITLE_CHUNK]
+        lines = "\n".join(f"{k}|{c['no']:02d}|{c['title']}" for k, c in enumerate(chunk))
+        out = llm.generate_json(PICK_PROMPT.format(cats=CAT_TEXT, lines=lines), max_out=32768)
+        for row in (out or {}).get("keep", []) if isinstance(out, dict) else []:
+            try:
+                c = chunk[int(row["i"])]
+            except (KeyError, ValueError, TypeError, IndexError):
+                continue
+            c = dict(c, event=str(row.get("event") or c["title"])[:80],
+                     cat=row.get("cat") if row.get("cat") in CATEGORIES else "OTHER")
+            kept.append(c)
+    stats["kept"] = len(kept)
+    return kept
+
+
+def choose(kept, limit):
+    """여러 언론사가 다룬 사건부터, 사건마다 서로 다른 언론사 PER_EVENT곳까지. 남으면 한 곳만 쓴 사건을 언론사 돌아가며."""
+    groups = {}
+    for c in kept:
+        g = groups.setdefault(norm_label(c["event"]), {})
+        g.setdefault(c["no"], c)                      # 한 사건에서 언론사당 한 건
+    multi = sorted((g for g in groups.values() if len(g) >= 2), key=lambda g: -len(g))
+    chosen = []
+    for g in multi:
+        for c in sorted(g.values(), key=lambda c: -c["ts"])[:PER_EVENT]:
+            if len(chosen) >= limit:
+                return chosen, len(multi)
+            chosen.append(c)
+    singles = {}
+    for g in groups.values():
+        if len(g) == 1:
+            c = next(iter(g.values()))
+            singles.setdefault(c["no"], []).append(c)
+    for v in singles.values():
+        v.sort(key=lambda c: -c["ts"])
+    while len(chosen) < limit and any(singles.values()):
+        for no in list(singles):
+            if singles[no] and len(chosen) < limit:
+                chosen.append(singles[no].pop(0))
+    return chosen, len(multi)
+
+
+# ---------- ③ 받기 ----------
+
+def fetch_all(chosen, hosts, stats):
+    """본문을 받는다. 언론사를 번갈아 받아 같은 사이트 간격을 겹쳐 쓴다. {id: 본문}"""
+    by = {}
+    for c in chosen:
+        by.setdefault(c["no"], []).append(c)
+    order = []
+    while any(by.values()):
+        for no in list(by):
+            if by[no]:
+                order.append(by[no].pop(0))
+    texts, blocked = {}, set()
+    for c in order:
+        if c["no"] in blocked:
+            c["fetch"] = {"verdict": "건너뜀(같은 언론사 막힘)"}
+            continue
+        try:
+            row, text = net.get_article(c["url"], hosts[c["no"]])
+        except net.Blocked as b:
+            row, text = b.args[0], None
+            blocked.add(c["no"])
+        except Exception as e:
+            row, text = {"verdict": f"오류({type(e).__name__})"}, None
+        c["fetch"] = row
+        if text:
+            texts[c["id"]] = text
+    stats["fetched"] = len(texts)
+    stats["fetchFailed"] = len(chosen) - len(texts)
+    stats["blockedFetch"] = sorted(blocked)
+    return texts
+
+
+# ---------- ④ 사실 ----------
+
+def _clean_fact(f):
+    if not isinstance(f, dict) or not str(f.get("what") or "").strip():
+        return None
+    q = f.get("quote") if isinstance(f.get("quote"), dict) else None
+    if q and (not q.get("text") or not q.get("speaker") or len(q["text"]) > 120):
+        q = None
+    nums = []
+    for n in f.get("numbers") or []:
+        if isinstance(n, dict) and str(n.get("value") or "").strip():
+            nums.append({"name": str(n.get("name") or "")[:60], "value": str(n["value"])[:40],
+                         "unit": str(n.get("unit") or "")[:20],
+                         "kind": n.get("kind") if n.get("kind") in ("발표", "예상", "기타") else "기타"})
+    stocks = [{"name": str(s.get("name") or "")[:40],
+               "code": s.get("code") if re.fullmatch(r"\d{6}", str(s.get("code") or "")) else ""}
+              for s in (f.get("stocks") or []) if isinstance(s, dict) and s.get("name")]
+    return {
+        "what": str(f["what"]).strip()[:200], "who": str(f.get("who") or "")[:80], "when": str(f.get("when") or "")[:20],
+        "numbers": nums, "quote": q, "stocks": stocks, "sector": str(f.get("sector") or "")[:40],
+        "cat": f.get("cat") if f.get("cat") in CATEGORIES else "OTHER",
+        "direction": f.get("direction") if f.get("direction") in ("up", "down", "neutral") else "neutral",
+        "stage": f.get("stage") if f.get("stage") in ("confirmed", "discussing") else "confirmed",
+        "origin": f.get("origin") if f.get("origin") in ("공시", "보도자료", "정부 발표", "통계") else "",
+    }
+
+
+def copied(what, text, n=25):
+    """what에 기사 본문과 n글자 이상 같은 구간이 있나 (띄어쓰기 무시)."""
+    a, b = re.sub(r"\s+", "", what), re.sub(r"\s+", "", text)
+    return any(a[i:i + n] in b for i in range(0, max(0, len(a) - n + 1), 3))
+
+
+def batches(items, texts):
+    cur, size = [], 0
+    for c in items:
+        n = len(texts[c["id"]])
+        if cur and (len(cur) >= FACT_BATCH_N or size + n > FACT_BATCH_CHARS):
+            yield cur
+            cur, size = [], 0
+        cur.append(c)
+        size += n
+    if cur:
+        yield cur
+
+
+def extract_facts(chosen, texts, stats):
+    have = [c for c in chosen if c["id"] in texts]
+    stats.update(facts=0, copiedFacts=0, factBatchesFailed=0)
+    for batch in batches(have, texts):
+        parts = []
+        for c in batch:
+            when = datetime.fromtimestamp(c["ts"], KST).strftime("%Y-%m-%d %H:%M") if c["ts"] else "모름"
+            parts.append(f"=== id: {c['id']} | 언론사 {c['no']:02d} | 게시 {when} ===\n제목: {c['title']}\n{texts[c['id']]}")
+        try:
+            out = llm.generate_json(FACTS_PROMPT.format(cats=CAT_TEXT, articles="\n\n".join(parts)), max_out=16384)
+        except llm.LLMError:
+            stats["factBatchesFailed"] += 1
+            continue
+        got = {str(a.get("id")): a.get("facts") or [] for a in (out or {}).get("articles", [])
+               if isinstance(a, dict)} if isinstance(out, dict) else {}
+        for c in batch:
+            if c["id"] not in got:
+                continue
+            facts = []
+            for f in got[c["id"]]:
+                f = _clean_fact(f)
+                if not f:
+                    continue
+                if copied(f["what"], texts[c["id"]]):
+                    f["copied"] = True          # 기사 문장과 겹침. 글에 쓰지 않는다 (받는 쪽이 거름)
+                    stats["copiedFacts"] += 1
+                facts.append(f)
+            c["facts"] = facts[:8]
+            stats["facts"] += len(c["facts"])
+    for c in chosen:
+        texts.pop(c["id"], None)                # 본문은 여기서 모두 버린다
+
+
+# ---------- ⑤ 사건 ----------
+
+def num_key(n):
+    return (re.sub(r"[\s,]", "", n["value"]), n["unit"].strip())
+
+
+def build_events(arts, stats):
+    """arts: [{id, no, url, title, publishedAt, facts}] → 사건 목록."""
+    fidx, lines = {}, []
+    for a in arts:
+        for j, f in enumerate(a.get("facts") or []):
+            if f.get("copied"):
+                continue
+            fid = f"{a['id'][:10]}-{j}"
+            fidx[fid] = (a, f)
+            nums = "; ".join(f"{n['name']} {n['value']}{n['unit']}" for n in f["numbers"])
+            lines.append(f"{fid}|{a['no']:02d}|{f['cat']}|{f['what']}" + (f" ({nums})" if nums else ""))
+    if not lines:
+        return []
+    out = llm.generate_json(EVENTS_PROMPT.format(cats=CAT_TEXT, lines="\n".join(lines)), max_out=32768)
+    groups, used = [], set()
+    for e in (out or {}).get("events", []) if isinstance(out, dict) else []:
+        ids = [x for x in (e.get("facts") or []) if x in fidx and x not in used]
+        if ids:
+            used.update(ids)
+            groups.append((str(e.get("title") or "")[:120], e.get("cat") if e.get("cat") in CATEGORIES else "OTHER", ids))
+    for fid in fidx:                                         # 모델이 빠뜨린 사실은 혼자 한 사건
+        if fid not in used:
+            groups.append((fidx[fid][1]["what"][:120], fidx[fid][1]["cat"], [fid]))
+    events = []
+    for title, cat, ids in groups:
+        outlets = sorted({fidx[x][0]["no"] for x in ids})
+        nums = {}
+        for x in ids:
+            a, f = fidx[x]
+            for n in f["numbers"]:
+                k = num_key(n)
+                d = nums.setdefault(k, {"name": n["name"], "value": n["value"], "unit": n["unit"], "kind": n["kind"], "outlets": set()})
+                d["outlets"].add(a["no"])
+        numbers = [dict(d, outlets=sorted(d["outlets"]), agreed=len(d["outlets"]) >= 2) for d in nums.values()]
+        dirs = [fidx[x][1]["direction"] for x in ids]
+        sources = {}
+        for x in ids:
+            a = fidx[x][0]
+            sources[a["id"]] = {"no": a["no"], "url": a["url"], "title": a["title"], "publishedAt": a.get("publishedAt")}
+        events.append({
+            "title": title, "cat": cat, "outlets": outlets, "outletCount": len(outlets), "single": len(outlets) < 2,
+            "facts": [dict(fidx[x][1], no=fidx[x][0]["no"], article=fidx[x][0]["id"]) for x in ids],
+            "numbers": numbers, "agreedNumbers": sum(1 for n in numbers if n["agreed"]),
+            "direction": ("up" if dirs.count("up") > dirs.count("down") else
+                          "down" if dirs.count("down") > dirs.count("up") else "neutral"),
+            "stage": "discussing" if all(fidx[x][1]["stage"] == "discussing" for x in ids) else "confirmed",
+            "sources": list(sources.values()),
+        })
+    events.sort(key=lambda e: (-e["outletCount"], -len(e["facts"])))
+    stats["events"] = len(events)
+    stats["multiEvents"] = sum(1 for e in events if not e["single"])
+    return events
+
+
+# ---------- 실행 ----------
+
+def main():
+    from google.cloud import firestore
+    from google.cloud.firestore_v1.base_query import FieldFilter
+
+    db = firestore.Client(project=os.environ["GCP_PROJECT"])
+    now = datetime.now(timezone.utc)
+    run_id = os.environ.get("GITHUB_RUN_ID") or now.strftime("local-%Y%m%d%H%M%S")
+    stats = {"listed": {}, "blockedList": [], "noFeed": [], "errorList": {}, "stage": "목록"}
+    run_ref = db.collection("runs").document(str(run_id))
+    try:
+        outlets = sorted((d.to_dict() for d in db.collection("outlets").stream() if d.to_dict().get("enabled", True)),
+                         key=lambda o: o["no"])
+        hosts = {o["no"]: o["host"] for o in outlets}
+        states = {}
+        for o in outlets:
+            s = db.collection("outlet_state").document(f"{o['no']:02d}").get()
+            states[o["no"]] = s.to_dict() if s.exists else {}
+
+        # ① 목록
+        cands, new_ids, feeds = list_new(outlets, states, now, stats)
+        for no, feed in feeds.items():
+            db.collection("outlets").document(f"{no:02d}").update({"feed": feed, "feedAt": now})
+        log(f"① 목록: 언론사 {len(outlets)}곳 중 {len(stats['listed'])}곳에서 새 기사 {len(cands):,}건 "
+            f"(목록 없음 {len(stats['noFeed'])}곳, 막힘 {len(stats['blockedList'])}곳, 오류 {len(stats['errorList'])}곳)")
+        if not llm.key():
+            stats["stage"] = "키 없음"
+            log("GEMINI_API_KEY가 없어 목록만 보고 끝냅니다 (이미 본 기사로 기록하지 않음)")
+            return
+        if not cands:
+            stats["stage"] = "새 기사 없음"
+            return
+
+        # ② 고르기
+        stats["stage"] = "고르기"
+        kept = pick(cands, stats)
+        chosen, multi = choose(kept, MAX_FETCH)
+        stats["chosen"], stats["multiGroups"] = len(chosen), multi
+        log(f"② 고르기: {len(kept):,}건 남김, 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
+        # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게)
+        batch = db.batch()
+        for no, ids in new_ids.items():
+            seen = (states.get(no, {}).get("seen", []) + ids)[-SEEN_CAP:]
+            batch.set(db.collection("outlet_state").document(f"{no:02d}"), {"seen": seen, "lastRunAt": now})
+        batch.commit()
+
+        # ③ 받기
+        stats["stage"] = "받기"
+        texts = fetch_all(chosen, hosts, stats)
+        log(f"③ 받기: 성공 {stats['fetched']}건, 실패 {stats['fetchFailed']}건, 막힌 언론사 {len(stats['blockedFetch'])}곳, "
+            f"본문 평균 {sum(map(len, texts.values())) // max(1, len(texts)):,}자")
+
+        # ④ 사실
+        stats["stage"] = "사실"
+        extract_facts(chosen, texts, stats)
+        log(f"④ 사실: 사실 {stats['facts']}개 (기사 문장과 겹친 줄 {stats['copiedFacts']}개, 실패한 묶음 {stats['factBatchesFailed']}개)")
+        batch = db.batch()
+        for c in chosen:
+            doc = {"no": c["no"], "url": c["url"], "title": c["title"],
+                   "publishedAt": datetime.fromtimestamp(c["ts"], timezone.utc) if c["ts"] else None,
+                   "foundAt": now, "run": str(run_id), "event": c["event"], "cat": c["cat"],
+                   "fetch": c.get("fetch", {}), "facts": c.get("facts", []), "factCount": len(c.get("facts", [])),
+                   "model": ",".join(llm.MODELS)}
+            if "facts" in c:
+                doc["extractedAt"] = now
+            batch.set(db.collection("articles").document(c["id"]), doc)
+        batch.commit()
+
+        # ⑤ 사건 (지난 실행의 사실까지 함께)
+        stats["stage"] = "사건"
+        since = now - timedelta(hours=EVENT_HOURS)
+        arts = [dict(d.to_dict(), id=d.id) for d in
+                db.collection("articles").where(filter=FieldFilter("extractedAt", ">=", since)).stream()]
+        events = build_events(arts, stats)
+        db.collection("eventsets").document(str(run_id)).set({
+            "createdAt": now, "since": since, "articles": len(arts), "events": events,
+            "edition": now.astimezone(KST).strftime("%Y-%m-%d %H시"),
+        })
+        log(f"⑤ 사건: 기사 {len(arts)}건에서 사건 {stats.get('events', 0)}개, 두 곳 이상 {stats.get('multiEvents', 0)}개")
+        stats["stage"] = "끝"
+    except llm.LLMError as e:
+        stats["llmError"] = str(e)
+        log(f"Gemini 실패({stats['stage']} 단계): {e}")
+        raise
+    finally:
+        stats["requests"] = net.stats["requests"]
+        stats["llm"] = {"calls": llm.stats["calls"], "byModel": llm.stats["byModel"], "errors": llm.stats["errors"]}
+        stats["startedAt"], stats["finishedAt"] = now, datetime.now(timezone.utc)
+        run_ref.set(stats)
+        log(f"사이트 요청 {net.stats['requests']}번, Gemini 호출 {llm.stats['calls']}번 {llm.stats['byModel']}"
+            + (f", 오류 {llm.stats['errors']}" if llm.stats["errors"] else ""))
+
+
+if __name__ == "__main__":
+    main()

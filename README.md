@@ -11,8 +11,16 @@
 
 ## 지금 단계
 
-0단계 접속 시험 (`worker/probe.py`, Actions → probe → Run workflow).
+1단계 사실 뽑기 (`worker/collect.py`, 하루 두 번 07:00 · 16:30 KST). 목록 → 제목으로 고르기 → 본문 받기 → 사실 뽑기 → 사건 묶기. 글은 아직 쓰지 않는다.
+
+| 파일 | 하는 일 |
+| --- | --- |
+| `worker/net.py` | robots · 간격 · 목록(사이트맵 · RSS) · 본문 추출 |
+| `worker/llm.py` | Gemini 호출 (입력 · 응답 원문은 로그에 남기지 않음) |
+| `worker/collect.py` | 1단계 수집 |
+| `worker/probe.py` | 0단계 접속 시험 (손으로만) |
 
 ## 설정
 
-저장소 변수(Variables): `GCP_PROJECT` · `WIF_PROVIDER` · `WIF_SERVICE_ACCOUNT`. Google Cloud에는 키 파일 없이 접속한다.
+- 저장소 변수(Variables): `GCP_PROJECT` · `WIF_PROVIDER` · `WIF_SERVICE_ACCOUNT`, 선택 `GEMINI_MODELS`(쉼표로, 비우면 `gemini-3.5-flash-lite,gemini-3.1-flash-lite`). Google Cloud에는 키 파일 없이 접속한다.
+- 비밀 값(Secrets): `GEMINI_API_KEY`. 없으면 목록만 보고 끝낸다.
