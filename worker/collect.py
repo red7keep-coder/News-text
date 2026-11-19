@@ -71,6 +71,18 @@ JSON만 답하세요: {{"keep":[{{"i":번호,"event":"사건 이름","cat":"코�
 {lines}
 """
 
+MERGE_PROMPT = """아래는 여러 언론사 기사 제목에 붙인 사건 이름 목록입니다. 한 줄 형식: 번호|사건 이름|예시 제목
+제목을 나눠서 따로 이름을 붙였기 때문에, 같은 사건에 다른 이름이 붙어 있을 수 있습니다.
+같은 사건(같은 회사의 같은 발표 · 같은 정책 · 같은 지표 발표 · 같은 날 같은 시장 마감)을 가리키는 번호끼리 묶으세요.
+주제가 비슷해도 다른 회사 · 다른 발표 · 다른 날이면 묶지 마세요. 애매하면 묶지 마세요.
+두 개 이상 묶이는 것만 답하세요.
+
+JSON만 답하세요: {{"groups":[[번호,번호]]}}
+
+목록:
+{lines}
+"""
+
 FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내부 재료이며, 기사 문장을 옮기면 안 됩니다.
 
 뽑는 것: 누가 · 언제 · 무엇을 했나, 숫자(발표치 · 예상치 · 금액 · 비율 · 날짜), 누가 말했는지 분명한 짧은 발언(한 문장 이하),
@@ -201,6 +213,47 @@ def pick(cands, stats):
             kept.append(c)
     stats["kept"] = len(kept)
     return kept
+
+
+def merge_events(kept, stats):
+    """고르기는 제목을 TITLE_CHUNK개씩 나눠 이름을 붙이므로 같은 사건에 다른 이름이 붙는다 (11-19: 두 곳 이상 사건 0개).
+    이름 목록을 한 번 더 보여 주고 같은 사건 이름을 하나로 합친다. 실패해도 고르기는 그대로 간다."""
+    names = {}
+    for c in kept:
+        names.setdefault(norm_label(c["event"]), (c["event"], c["title"]))
+    keys = list(names)
+    stats["eventNames"] = len(keys)
+    if len(keys) < 2:
+        return kept
+    remap = {}
+    for s in range(0, len(keys), TITLE_CHUNK):
+        part = keys[s:s + TITLE_CHUNK]
+        lines = "\n".join(f"{k}|{names[key][0]}|{names[key][1][:60]}" for k, key in enumerate(part))
+        try:
+            out = llm.generate_json(MERGE_PROMPT.format(lines=lines), max_out=16384)
+        except llm.LLMError:
+            stats["mergeFailed"] = True
+            continue
+        for g in (out or {}).get("groups", []) if isinstance(out, dict) else []:
+            try:
+                idx = sorted({int(i) for i in g if 0 <= int(i) < len(part)})
+            except (TypeError, ValueError):
+                continue
+            if len(idx) < 2:
+                continue
+            head = remap.get(part[idx[0]], part[idx[0]])
+            for i in idx[1:]:
+                remap[part[i]] = head
+    out_kept = []
+    for c in kept:
+        k, hops = norm_label(c["event"]), 0
+        while k in remap and remap[k] != k and hops < 20:     # 합친 이름이 다시 합쳐진 경우까지 따라간다
+            k, hops = remap[k], hops + 1
+        if hops:
+            c = dict(c, event=names[k][0])
+        out_kept.append(c)
+    stats["eventNamesMerged"] = len({norm_label(c["event"]) for c in out_kept})
+    return out_kept
 
 
 def choose(kept, limit, same=None):
@@ -486,10 +539,11 @@ def main():
 
         # ② 고르기
         stats["stage"] = "고르기"
-        kept = pick(cands, stats)
+        kept = merge_events(pick(cands, stats), stats)
         chosen, multi = choose(kept, MAX_FETCH, same)
         stats["chosen"], stats["multiGroups"] = len(chosen), multi
-        log(f"② 고르기: {len(kept):,}건 남김, 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
+        log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개, "
+            f"두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
         # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게)
         batch = db.batch()
         for no, ids in new_ids.items():
