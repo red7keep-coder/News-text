@@ -11,6 +11,7 @@
 """
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -22,6 +23,8 @@ WRITE_MODELS = [m.strip() for m in (os.environ.get("GEMINI_WRITE_MODELS") or "ge
 WRITE_GAP = 13             # 분당 5회 한도
 WRITE_TRIES = 3            # 쓰기 + 고쳐 쓰기 2번
 DEDUP_HOURS = 48
+BUSY_WAIT = 300            # Gemini 혼잡(503)이면 5분 쉬고
+BUSY_ROUNDS = 2            # 두 번까지 다시
 MIN_CHARS, MAX_CHARS = 600, 900
 TITLE_MAX = 48
 
@@ -163,6 +166,20 @@ def check(post, ev, ok_set, bad_set, fact_text):
     return list(dict.fromkeys(issues))
 
 
+def _generate(prompt):
+    """혼잡(503 · 시간 초과)이면 BUSY_WAIT초 쉬고 BUSY_ROUNDS번까지 다시. 한도(429)는 기다리지 않고 올려 보낸다.
+    max_out은 넉넉히: 생각하는 모델(Hydrogen · 3.6 Flash)은 생각 토큰도 출력 한도에 들어가 4096에서 답이 잘렸다(11-19)."""
+    for round_ in range(BUSY_ROUNDS + 1):
+        try:
+            return llm.generate_json(prompt, max_out=16384, models=WRITE_MODELS, gap=WRITE_GAP, temperature=0.4, attempts=3)
+        except llm.LLMError as e:
+            busy = "503" in str(e) or "접속 실패" in str(e)
+            if not busy or round_ == BUSY_ROUNDS:
+                raise
+            log(f"   Gemini 혼잡, {BUSY_WAIT // 60}분 쉬고 다시 ({round_ + 1}/{BUSY_ROUNDS})")
+            time.sleep(BUSY_WAIT)
+
+
 def write_one(ev, date):
     facts, agreed, single, ok_set, bad_set, fact_text = materials(ev)
     base = dict(title=ev["title"], cat=CAT_KO.get(ev.get("cat"), "그 밖"), date=date, facts=facts, agreed=agreed, single=single,
@@ -170,8 +187,7 @@ def write_one(ev, date):
     post, issues, tries = None, [], 0
     for tries in range(1, WRITE_TRIES + 1):
         fix = FIX_BLOCK.format(issues="\n".join(f"- {i}" for i in issues), title=post["title"], body=post["body"]) if post else ""
-        out = llm.generate_json(WRITE_PROMPT.format(fix=fix, **base), max_out=4096, models=WRITE_MODELS, gap=WRITE_GAP,
-                                temperature=0.4, attempts=3)
+        out = _generate(WRITE_PROMPT.format(fix=fix, **base))
         if not isinstance(out, dict):
             issues = ["JSON 형식이 아닙니다"]
             continue
@@ -230,7 +246,7 @@ def main():
         except llm.LLMError as e:
             stats["skipped"] += 1
             log(f"⑥ {i + 1}편: Gemini 실패로 건너뜀 ({e})")
-            if "모든 모델 실패" in str(e) or "429" in str(e):
+            if "모든 모델 실패" in str(e) or "429" in str(e) or "503" in str(e) or "접속 실패" in str(e):
                 break                                         # 두 모델 모두 한도면 남은 글은 그날 건너뛴다 (기획안 6절)
             continue
         status = "초안" if not issues else "검사 실패"
