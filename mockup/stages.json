@@ -1,7 +1,8 @@
 {
   "plan": [
-    {"name": "예시 · 첫 화면", "todo": "목업 확인 → 렌더러 반영 → 배포(묻고)", "files": ["example/*"]},
-    {"name": "운영자 페이지", "todo": "목업 확인 → 렌더러(index.html) 반영 → 배포(묻고, deploy.py hosting)", "files": ["admin/*"]}
+    {"name": "예시 · 첫 화면", "todo": "목업 확인 → 렌더러 반영 → 배포(묻고)", "files": ["example/*"]}
   ],
-  "live": []
+  "live": [
+    {"name": "운영자 페이지", "files": ["admin/*"]}
+  ]
 }
