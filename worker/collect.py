@@ -31,7 +31,27 @@ FACT_BATCH_CHARS = 40_000  # 사실 뽑기 한 번에 넣을 본문 글자 수 (
 CATEGORIES = ["RATES_FED", "INFLATION", "GROWTH_JOBS", "TARIFF_TRADE", "GEOPOLITICS", "OIL_ENERGY", "AI_CAPEX",
               "EARNINGS", "CORP_EVENT", "CREDIT_BANKS", "MARKET_STRUCTURE", "REGULATION", "FISCAL_POLITICS",
               "FX_GLOBAL", "CRYPTO", "REAL_ESTATE", "OTHER"]   # 유튜브 수집기 · 블로그와 같은 분류표 (데이터-설계.md)
-CAT_TEXT = ", ".join(CATEGORIES)
+# 정의는 alphascope-docs 이슈-분류-코드표.md를 국내 기사에 맞게 줄인 것. 코드만 주면 모델이 이름으로 짐작해 어긋난다 (11-19: 연구 성과 → EARNINGS)
+CAT_DEFS = {
+    "RATES_FED": "금리 · 중앙은행: 한국은행 · 연준 등 금리 결정, 통화정책, 국채 금리",
+    "INFLATION": "물가: 소비자 · 생산자 물가, 임금, 기대 인플레",
+    "GROWTH_JOBS": "경기 · 고용 · 소비: GDP, 고용 · 실업, 소매판매, 소비자심리",
+    "TARIFF_TRADE": "관세 · 무역: 관세, 무역 협상, 수출입 실적, 공급망 재편 (수출 통제는 REGULATION)",
+    "GEOPOLITICS": "지정학: 전쟁 · 휴전, 외교 · 안보, 제재, 재난",
+    "OIL_ENERGY": "유가 · 에너지 · 원자재: 원유, 가스, 전력, 원전, 금 · 원자재",
+    "AI_CAPEX": "AI 투자 · 반도체 수요: 데이터센터, GPU · HBM 수요, AI 설비투자, AI 사업 진출",
+    "EARNINGS": "실적: 매출 · 영업이익 등 실적 발표, 가이던스, 컨센서스, 목표가. 실적 숫자가 핵심일 때만",
+    "CORP_EVENT": "기업 사건: 인수합병, 상장 · 공모, 자사주, 분할, 배당, 증자 · 감자 · 사채, 경영진, 대형 계약, 신제품 · 신사업, 설비 투자, 노사",
+    "REGULATION": "규제 · 산업정책: 법안, 금융당국 규제, 수출 통제, 보조금, 소송 · 판결, 인허가",
+    "FISCAL_POLITICS": "재정 · 정치: 예산, 세제, 국가 부채, 선거 · 정권, 신용등급",
+    "CREDIT_BANKS": "금융 시스템 · 신용: 은행 · 보험 · 카드사, 대출 · 부실, 신용 경색, 금융사고",
+    "MARKET_STRUCTURE": "수급 · 시장 구조: 지수 등락 · 마감 시황, 외국인 · 기관 수급, 공매도, 지수 편입, 거래 제도",
+    "FX_GLOBAL": "환율 · 해외 시장: 원 · 달러 환율, 외환 보유 · 대외 자산, 해외 증시 급변",
+    "CRYPTO": "암호화폐: 비트코인, 거래소, 스테이블코인",
+    "REAL_ESTATE": "부동산: 집값, 분양, 재건축, 주택 대출 금리, 리츠",
+    "OTHER": "그 밖: 시장과 관련은 있으나 위 어디에도 안 맞는 것 (예: 기술 · 연구 성과)",
+}
+CAT_TEXT = "\n" + "\n".join(f"- {c}: {CAT_DEFS[c]}" for c in CATEGORIES)
 
 PICK_PROMPT = """아래는 국내 언론사 기사 제목 목록입니다. 한 줄 형식: 번호|언론사번호|제목
 주식 투자 블로그의 사건별 글 재료로 쓸 기사만 고르세요.
@@ -83,7 +103,7 @@ EVENTS_PROMPT = """아래는 여러 언론사 기사에서 뽑은 사실 목록�
 같은 사건을 다룬 사실끼리 묶으세요. 같은 회사의 같은 발표 · 같은 정책 · 같은 지표 발표면 같은 사건입니다.
 주제가 비슷해도 다른 회사 · 다른 발표면 다른 사건입니다.
 모든 사실id는 정확히 한 사건에 들어가야 합니다 (사실 하나뿐인 사건도 됩니다).
-사건마다 title을 새로 쓴 한 문장(40자 안팎)으로, cat을 분류 코드({cats}) 중 하나로 붙이세요.
+사건마다 title을 새로 쓴 한 문장(40자 안팎)으로, cat을 아래 분류 코드 중 하나로 붙이세요. 분류: {cats}
 
 JSON만 답하세요: {{"events":[{{"title":"","cat":"코드","facts":["사실id"]}}]}}
 
@@ -107,35 +127,59 @@ def norm_label(s):
 # ---------- ① 목록 ----------
 
 def list_new(outlets, states, now, stats):
-    """새 기사 후보 [{id, no, url, title, ts}]와 언론사별 새로 본 id."""
+    """새 기사 후보 [{id, no, url, title, ts}]와 언론사별 새로 본 id.
+    outlets 문서의 선택 칸: feeds(사람이 적은 목록 주소), freshHours(목록 시각이 하루 단위처럼 늦은 곳),
+    titleFromPage(제목 없는 목록만 있는 곳: 가장 새 기사 N건의 페이지 제목을 받는다)."""
     cands, new_ids, feeds = [], {}, {}
-    fresh_after = (now - timedelta(hours=FRESH_HOURS)).timestamp()
     for o in outlets:
         notes = []
+        key = f"{o['no']:02d}"
+        fresh_after = (now - timedelta(hours=o.get("freshHours") or FRESH_HOURS)).timestamp()
         seen = set(states.get(o["no"], {}).get("seen", []))
+        title_n = int(o.get("titleFromPage") or 0)
         try:
-            feed, items = net.discover(o["host"], notes, override=o.get("feeds"), cached=o.get("feed"), need_title=True)
+            feed, items = net.discover(o["host"], notes, override=o.get("feeds"), cached=o.get("feed"), need_title=True,
+                                       fresh_after=fresh_after, allow_untitled=title_n > 0)
+            if feed and title_n and items and not any(ti for _, _, ti in items):
+                items = _titles_from_pages(items, seen, fresh_after, title_n, notes)
         except net.Blocked:
             stats["blockedList"].append(o["no"])
+            stats["listNotes"][key] = notes
             continue
         except Exception as e:        # 한 곳의 오류로 전체를 멈추지 않는다
-            stats["errorList"][f"{o['no']:02d}"] = type(e).__name__
+            stats["errorList"][key] = type(e).__name__
+            stats["listNotes"][key] = notes
             continue
         if not feed:
             stats["noFeed"].append(o["no"])
+            stats["listNotes"][key] = notes
             continue
         if feed != o.get("feed"):
             feeds[o["no"]] = feed
         got = 0
         for t, url, title in items:
             i = aid(url)
-            if i in seen or (t and t < fresh_after):
+            if i in seen or (t and t < fresh_after) or not title:
                 continue
             cands.append({"id": i, "no": o["no"], "url": url, "title": title[:200], "ts": t})
             new_ids.setdefault(o["no"], []).append(i)
             got += 1
-        stats["listed"][f"{o['no']:02d}"] = got
+        stats["listed"][key] = got
+        if not got:
+            stats["listNotes"][key] = notes
     return cands, new_ids, feeds
+
+
+def _titles_from_pages(items, seen, fresh_after, n, notes):
+    """제목 없는 목록: 아직 안 본 새 기사 중 가장 새 n건만 페이지에서 제목을 받는다 (같은 사이트 간격은 net이 지킨다)."""
+    todo = [(t, u) for t, u, _ in items if aid(u) not in seen and not (t and t < fresh_after)][:n]
+    out = []
+    for t, u in todo:
+        title = net.page_title(u)       # Blocked는 부르는 쪽으로
+        if title:
+            out.append((t, u, title))
+    notes.append(f"페이지 제목 {len(out)}/{len(todo)}")
+    return out
 
 
 # ---------- ② 고르기 ----------
@@ -414,7 +458,7 @@ def main():
     db = firestore.Client(project=os.environ["GCP_PROJECT"])
     now = datetime.now(timezone.utc)
     run_id = os.environ.get("GITHUB_RUN_ID") or now.strftime("local-%Y%m%d%H%M%S")
-    stats = {"listed": {}, "blockedList": [], "noFeed": [], "errorList": {}, "stage": "목록"}
+    stats = {"listed": {}, "blockedList": [], "noFeed": [], "errorList": {}, "listNotes": {}, "stage": "목록"}
     run_ref = db.collection("runs").document(str(run_id))
     try:
         outlets = sorted((d.to_dict() for d in db.collection("outlets").stream() if d.to_dict().get("enabled", True)),

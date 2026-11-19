@@ -72,16 +72,17 @@ def _call(model, prompt, max_out):
         r = requests.post(URL.format(model=model), json=body, timeout=TIMEOUT,
                           headers={"x-goog-api-key": key(), "Content-Type": "application/json"})
     except requests.RequestException as e:
-        return 0, type(e).__name__
+        return 0, type(e).__name__, ""
     if r.status_code != 200:
-        return r.status_code, ""
+        return r.status_code, "", ""
     try:
         data = r.json()
         cand = data["candidates"][0]
-        text = "".join(p.get("text", "") for p in cand["content"]["parts"])
-        return 200, text
-    except (ValueError, KeyError, IndexError, TypeError):
-        return 200, ""
+        finish = str(cand.get("finishReason") or "")
+        text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))
+        return 200, text, finish
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        return 200, "", ""
 
 
 def generate_json(prompt, max_out=8192):
@@ -101,12 +102,13 @@ def generate_json(prompt, max_out=8192):
 def _with_model(model, prompt, max_out, has_next):
     last = ""
     for attempt in range(1, ATTEMPTS + 1):
-        code, text = _call(model, prompt, max_out)
+        code, text, finish = _call(model, prompt, max_out)
         if code == 200:
             try:
                 return extract_json(text)
             except ValueError:
-                last = "JSON 깨짐"
+                # 끝난 이유를 붙인다: MAX_TOKENS면 답이 잘린 것, STOP이면 형식이 틀린 것 (응답 원문은 남기지 않는다)
+                last = f"JSON 깨짐({finish or '이유 없음'})"
                 _count_error(last)
                 continue
         last = f"응답 {code}" if code else f"접속 실패({text})"

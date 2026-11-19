@@ -5,6 +5,7 @@
 - 기사 본문은 이 모듈 밖으로 문자열로만 나가고, 어디에도 저장하지 않는다.
 """
 import gzip
+import html as html_mod
 import json
 import re
 import time
@@ -204,15 +205,19 @@ def home_feeds(host):
     return out
 
 
-def discover(host, notes, override=None, cached=None, need_title=False, want=1):
+def discover(host, notes, override=None, cached=None, need_title=False, want=1, fresh_after=None, allow_untitled=False):
     """언론사 자체 목록에서 기사 항목을 찾는다. (쓴 목록 주소, [(시각, 주소, 제목)] 최신 순).
-    need_title이면 제목이 붙은 기사 항목이 있는 목록만 쓴다 (제목으로 기사를 고르는 collect용)."""
+    need_title이면 제목이 붙은 기사 항목이 있는 목록만 쓴다 (제목으로 기사를 고르는 collect용).
+    allow_untitled면 제목 있는 목록이 끝내 없을 때 제목 없는 목록을 돌려준다 (부르는 쪽이 페이지에서 제목을 받는다).
+    fresh_after(유닉스 시각)를 주면 가장 새 항목이 그보다 오래된 목록은 건너뛴다. 멈춘 사이트맵을 고르지 않게 (11-19 YTN).
+    다른 목록이 없으면 건너뛴 목록 중 가장 새 것을 돌려준다."""
     rb = robots_for(host)
     queue = list(override or []) + ([cached] if cached else [])
     queue += sorted(rb.sitemaps, key=lambda u: 0 if re.search(r"news", u, re.I) else 1)
     queue += [f"https://{host}{p}" for p in COMMON_FEEDS]
     queue = list(dict.fromkeys(queue))
     tries, seen, looked_home = 0, set(), False
+    stale, untitled = None, None          # (가장 새 항목 시각, 주소, 항목)
     while tries < MAX_FEED_TRIES:
         if not queue:
             if looked_home:
@@ -246,15 +251,62 @@ def discover(host, notes, override=None, cached=None, need_title=False, want=1):
         titled = [a for a in arts if a[2]]
         notes.append(f"목록 {len(items)}건 중 기사 {len(arts)}건(제목 {len(titled)})")
         use = titled if need_title else arts
+        if need_title and allow_untitled and len(arts) >= want and not titled:
+            newest = max(a[0] for a in arts)
+            if not untitled or newest > untitled[0]:
+                untitled = (newest, url, arts)
         if len(use) >= want:
-            use.sort(key=lambda x: -x[0])
-            uniq = {}
-            for a in use:
-                uniq.setdefault(a[1], a)
-            return url, list(uniq.values())
+            newest = max(a[0] for a in use)
+            if fresh_after and newest and newest < fresh_after:
+                notes.append("오래된 목록")
+                if not stale or newest > stale[0]:
+                    stale = (newest, url, use)
+                continue
+            return url, _uniq(use)
+    for pick in (stale, untitled):
+        if pick:
+            notes.append("오래된 목록 씀" if pick is stale else "제목 없는 목록 씀")
+            return pick[1], _uniq(pick[2])
     if not tries:
         notes.append("볼 수 있는 목록 없음")
     return None, []
+
+
+def _uniq(items):
+    """최신 순, 같은 주소는 한 번."""
+    uniq = {}
+    for a in sorted(items, key=lambda x: -x[0]):
+        uniq.setdefault(a[1], a)
+    return list(uniq.values())
+
+
+def page_title(url):
+    """기사 페이지의 제목 (og:title → <title>). 제목 없는 목록만 있는 언론사용. 본문은 읽지 않고 버린다.
+    403 · 429 · 차단 화면이면 Blocked, 못 얻으면 빈 문자열."""
+    if not allowed(url):
+        return ""
+    status, body, _ = fetch(url)
+    if status in (403, 429) or (status == 200 and CHALLENGE.search(body[:20000].decode("utf-8", "ignore"))):
+        raise Blocked({"verdict": "막힘", "status": status})
+    if status != 200 or not body:
+        return ""
+    try:
+        doc = lxml_html.fromstring(_decode(body))
+    except (ValueError, etree.ParserError):
+        return ""
+    t = doc.xpath('string(//meta[@property="og:title"]/@content)') or doc.xpath("string(//title)")
+    return re.sub(r"\s+", " ", html_mod.unescape(t)).strip()
+
+
+def _decode(body):
+    """바이트 → 글자. 페이지에 적힌 charset → UTF-8 → CP949 순 (lxml이 바이트를 latin-1로 읽어 한글이 깨졌다, 11-19)."""
+    m = re.search(rb'charset=["\']?([A-Za-z0-9_-]+)', body[:4000])
+    for enc in ([m.group(1).decode("ascii")] if m else []) + ["utf-8", "cp949"]:
+        try:
+            return body.decode(enc)
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return body.decode("utf-8", "replace")
 
 
 # ---------- 기사 본문 ----------
