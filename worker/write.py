@@ -28,6 +28,7 @@ BUSY_WAIT = 300            # Gemini 혼잡(503)이면 5분 쉬고
 BUSY_ROUNDS = 2            # 두 번까지 다시
 MIN_CHARS, MAX_CHARS = 300, 900   # 600자 하한은 재료가 적은 사건에서 같은 말 되풀이를 낳았다 (11-20)
 BOLD_MIN, BOLD_MAX, BOLD_PARA, BOLD_LEN = 2, 6, 2, 20   # 굵게(**…**): 핵심 숫자 · 사건 요지만 (11-20)
+DAY_MAX = 2                                                # 같은 날짜는 본문에 두 번까지 (11-20)
 REPEAT_SCORE = 0.6               # 두 문장의 낱말이 이만큼 겹치면 되풀이로 본다 (11-20 초안 두 편으로 맞춤)
 TITLE_MAX = 48
 
@@ -60,8 +61,10 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 - 문체: 본문은 합니다체(-했습니다 · -입니다)로 끝냅니다. 모든 문장이 '니다.'로 끝나야 합니다.
 - 제목: 헤드라인체. 명사형으로 끝내고 마침표 없이 {title_max}자 이내.
 - 숫자: '쓸 수 있는 숫자'만 값 그대로 씁니다. 계산 · 반올림 · 환산을 하지 않습니다. 숫자가 없으면 숫자 없이 씁니다.
+  1,000 이상은 세 자리마다 쉼표를 넣습니다. 예: 30,063원 · 5,137.89포인트 (연도 · 소수점 뒤는 그대로).
 - 날짜: 재료의 '때'에 적힌 꼴 그대로 씁니다. 이번 달은 '19일'처럼 일만, 올해 다른 달은 '10월 31일', 다른 해만 '2027년 6월 30일'.
-  올해 연도와 이번 달은 쓰지 않습니다. 가까운 문장에 같은 날짜가 또 나와도 '20일'처럼 짧게 씁니다.
+  올해 연도와 이번 달은 쓰지 않습니다. 날짜는 처음 한 번, 그리고 날짜가 바뀔 때만 씁니다(19일 … 18일 뉴욕증시는 …).
+  같은 날짜를 문장마다 다시 쓰지 않습니다. 같은 날짜는 본문에 두 번까지만 씁니다.
   '~ 기준으로 ~했습니다'는 '19일 기준 ~였습니다'처럼 줄여 씁니다.
 - 사람: 한국 사람은 '기관 · 부서 이름 직함' 순서로 씁니다. 예: '산업통상부 무역투자 강감찬 실장은' (O) / '강감찬 산업통상부 무역투자실장은' (X).
   대통령 · 총리 · 이름난 기업 총수처럼 널리 알려진 사람이 아니면 이름을 굵게 하지 않습니다.
@@ -216,6 +219,30 @@ def check_dates(text, today):
     return issues
 
 
+DAY = re.compile(r"(?<!\d)(?:\d{4}년\s*)?(?:\d{1,2}월\s*)?\d{1,2}일(?!\s*(간|동안|째|이동))")
+BARE = re.compile(r"(?<![\d,.])\d{5,}(?![\d,]|\s*년)")
+
+
+def check_repeat_dates(body):
+    """같은 날짜를 문장마다 다시 쓴 글 (11-20 사용자: '19일 코스피 … 19일 코스피 시장에서 … 19일 유가증권시장에서')."""
+    count = {}
+    for m in DAY.finditer(body):
+        k = re.sub(r"\s+", "", m.group())
+        count[k] = count.get(k, 0) + 1
+    many = [k for k, c in count.items() if c > DAY_MAX]
+    if many:
+        return [f"같은 날짜 '{many[0]}'를 {count[many[0]]}번 썼습니다. 처음 한 번과 날짜가 바뀔 때만 쓰고, {DAY_MAX}번까지로 줄이세요"]
+    return []
+
+
+def check_commas(text):
+    """쉼표 없는 큰 숫자 (11-20: '30063원' → '30,063원')."""
+    m = BARE.search(text)
+    if m:
+        return [f"숫자 '{m.group()}'에 쉼표를 넣으세요 (예: '{int(m.group()):,}')"]
+    return []
+
+
 def materials(ev, today=None):
     """(사실 줄, 쓸 숫자 줄, 쓰면 안 되는 숫자 줄, 쓸 숫자 집합, 한 곳 숫자 집합, 사실 글 전체).
     today를 주면 사실의 때를 '19일'처럼 바꿔 넣는다 (글에도 그 꼴로 쓰게)."""
@@ -254,6 +281,7 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
     body = plain(raw)                                        # 나머지 검사는 ** 를 뗀 글로
     if today:
         issues += check_dates(title + " " + body, today)
+    issues += check_repeat_dates(body) + check_commas(title + " " + body)
     n = len(body.replace("\n", ""))
     if n < MIN_CHARS or n > MAX_CHARS:
         issues.append(f"본문이 {n}자입니다. {MIN_CHARS} ~ {MAX_CHARS}자로 맞추세요")
