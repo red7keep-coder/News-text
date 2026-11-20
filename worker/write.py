@@ -88,6 +88,8 @@ BANNED = [(re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}"), "날짜를 '2026.11.19'처럼
 NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 DATE = re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}")
 TIME_UNIT = re.compile(r"^\s*(년|월|일|분기|시|분|차|번째|개월|주|회|호)")
+SHELL = re.compile(r"(공개|발표|공시|집계|제시|보고|소개)\s*(되었|됐|된다|되어)")
+DATE_WORD = re.compile(r"\d+\s*(년|월|일|분기)")
 JOSA = re.compile(r"(으로|에서|까지|부터|보다|이라고|라고|에게|하며|하고|했습니다|됐습니다|입니다|습니다|은|는|이|가|을|를|의|에|로|와|과|도|만)$")
 # 지수 마감 · 시황 기사: 사건을 한 줄 언급만 해도 사실이 뽑혀 출처로 붙는다 (11-20: 수출 1조 달러 글에 '코스닥 마감')
 WRAP = re.compile(r"마감|시황|증시|특징주|코스피|코스닥|지수|혼조|\d+(?:\.\d+)?p\b")
@@ -146,12 +148,24 @@ def _digits(text):
     return {n.replace(",", "") for n in NUM.findall(text or "")}
 
 
+def shell_fact(f, ok_values):
+    """'KT HCN의 자산총계 · 실적이 공개되었다'처럼 무엇이 나왔다는 말뿐이고, 알맹이인 숫자는 한 곳만 써서 글에 못 쓰는 사실.
+    재료로 주면 숫자 없는 빈 문장이 된다 (11-20)."""
+    w = f.get("what") or ""
+    if not SHELL.search(w):
+        return False
+    if any(n.get("value") in ok_values for n in f.get("numbers") or []):
+        return False
+    return not re.search(r"\d", DATE_WORD.sub("", w))
+
+
 def materials(ev):
     """(사실 줄, 쓸 숫자 줄, 쓰면 안 되는 숫자 줄, 쓸 숫자 집합, 한 곳 숫자 집합, 사실 글 전체)."""
     seen, facts = [], []
+    ok_values = {n["value"] for n in ev.get("numbers", []) if n.get("agreed")}
     for f in ev.get("facts", []):
         w = (f.get("what") or "").strip()
-        if not w or any(SequenceMatcher(None, w, x).ratio() > 0.8 for x in seen):
+        if not w or shell_fact(f, ok_values) or any(SequenceMatcher(None, w, x).ratio() > 0.8 for x in seen):
             continue
         seen.append(w)
         extra = []
