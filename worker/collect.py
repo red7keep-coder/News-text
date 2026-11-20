@@ -10,6 +10,7 @@
 공개 로그: 건수 · 글자 수 · 호출 수만. 언론사 이름 · 주소 · 제목 · 본문 · AI 입출력은 찍지 않는다.
 """
 import hashlib
+import html
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -132,6 +133,13 @@ def aid(url):
     return hashlib.sha1(url.encode("utf-8")).hexdigest()[:16]
 
 
+def clean_title(t):
+    """목록 제목에 남은 HTML 기호(&apos; · 두 번 감싼 &amp;quot;)를 푼다."""
+    for _ in range(2):
+        t = html.unescape(t)
+    return t.strip()
+
+
 def norm_label(s):
     return re.sub(r"[\s·,.'\"“”‘’]+", "", (s or "").lower())
 
@@ -173,7 +181,7 @@ def list_new(outlets, states, now, stats):
             i = aid(url)
             if i in seen or (t and t < fresh_after) or not title:
                 continue
-            cands.append({"id": i, "no": o["no"], "url": url, "title": title[:200], "ts": t})
+            cands.append({"id": i, "no": o["no"], "url": url, "title": clean_title(title)[:200], "ts": t})
             new_ids.setdefault(o["no"], []).append(i)
             got += 1
         stats["listed"][key] = got

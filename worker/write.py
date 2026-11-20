@@ -9,6 +9,7 @@
 공개 로그에는 건수 · 상태만 찍는다. 재료 · 글 · 제목 · 주소는 찍지 않는다 (기획안 3절).
 모델: GEMINI_WRITE_MODELS (기본 gemini-4-hydrogen → gemini-3.6-flash). 둘 다 하루 20회 · 분당 5회.
 """
+import html
 import os
 import re
 import time
@@ -25,7 +26,8 @@ WRITE_TRIES = 3            # 쓰기 + 고쳐 쓰기 2번
 DEDUP_HOURS = 48
 BUSY_WAIT = 300            # Gemini 혼잡(503)이면 5분 쉬고
 BUSY_ROUNDS = 2            # 두 번까지 다시
-MIN_CHARS, MAX_CHARS = 600, 900
+MIN_CHARS, MAX_CHARS = 300, 900   # 600자 하한은 재료가 적은 사건에서 같은 말 되풀이를 낳았다 (11-20)
+REPEAT_SCORE = 0.6                # 두 문장의 낱말이 이만큼 겹치면 되풀이로 본다 (11-20 초안 두 편으로 맞춤)
 TITLE_MAX = 48
 
 CAT_KO = {
@@ -52,11 +54,12 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 {single}
 
 규칙:
-- 분량: 본문 {min_chars} ~ {max_chars}자. 문단 3 ~ 5개, 문단 사이는 빈 줄.
+- 분량: 본문 {min_chars} ~ {max_chars}자. 문단 2 ~ 5개, 문단 사이는 빈 줄.
+  재료가 적으면 짧게 씁니다. 분량을 채우려고 같은 사실을 다른 말로 되풀이하지 않습니다. 한 사실은 글 전체에서 한 번만 씁니다.
 - 문체: 본문은 합니다체(-했습니다 · -입니다)로 끝냅니다. 모든 문장이 '니다.'로 끝나야 합니다.
 - 제목: 헤드라인체. 명사형으로 끝내고 마침표 없이 {title_max}자 이내.
 - 숫자: '쓸 수 있는 숫자'만 값 그대로 씁니다. 계산 · 반올림 · 환산을 하지 않습니다. 숫자가 없으면 숫자 없이 씁니다.
-  날짜는 2026.11.19처럼 점으로, 앞자리 0 없이 씁니다.
+  날짜는 '19일'처럼 씁니다. 기준일과 달이 다르면 '10월 31일', 해가 다르면 '2027년 6월 30일'처럼 씁니다.
 - 사실만 씁니다. 전망 · 평가 · 비유 · 기자 해석을 더하지 않습니다(좋다 · 우려 · 기대감 · 호재 · 악재 같은 말 금지).
 - 매수 · 매도 · 추천 같은 투자 권유를 쓰지 않습니다.
 - 재료의 문장을 그대로 옮기지 말고 새 문장으로 씁니다. 언론사 이름을 쓰지 않습니다.
@@ -79,15 +82,64 @@ FIX_BLOCK = """
 # 투자 권유 · 평가어 (사실 보도에 쓰이는 '순매수 · 순매도 · 매수세 · 매도세 · 매수 의견'은 뺀다)
 ADVICE = re.compile(r"(?<!순)(매수|매도)(?!세|우위|의견|\s?의견|액|량|대금|잔고|청구)|추천|사세요|파세요|담아|저가 매수|비중 (확대|축소)|투자 기회")
 OPINION = re.compile(r"호재|악재|기대감|우려|전망된다|전망입니다|보입니다|것으로 보|좋은|나쁜|긍정적|부정적")
-BANNED = [(re.compile(r"—"), "줄표(—)를 썼습니다"), (re.compile(r"섹터"), "'섹터'라는 말을 썼습니다"),
+BANNED = [(re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}"), "날짜를 '2026.11.19'처럼 썼습니다. '19일' · '11월 19일'처럼 쓰세요"),
+          (re.compile(r"—"), "줄표(—)를 썼습니다"), (re.compile(r"섹터"), "'섹터'라는 말을 썼습니다"),
           (re.compile(r"닿"), "'닿다'를 썼습니다"), (re.compile(r"이 (사건|소식|발표|기업)"), "'이 사건' 같은 지시어를 썼습니다")]
 NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 DATE = re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}")
 TIME_UNIT = re.compile(r"^\s*(년|월|일|분기|시|분|차|번째|개월|주|회|호)")
+JOSA = re.compile(r"(으로|에서|까지|부터|보다|이라고|라고|에게|하며|하고|했습니다|됐습니다|입니다|습니다|은|는|이|가|을|를|의|에|로|와|과|도|만)$")
+# 지수 마감 · 시황 기사: 사건을 한 줄 언급만 해도 사실이 뽑혀 출처로 붙는다 (11-20: 수출 1조 달러 글에 '코스닥 마감')
+WRAP = re.compile(r"마감|시황|증시|특징주|코스피|코스닥|지수|혼조|\d+(?:\.\d+)?p\b")
+# 시세가 곧 사건인 분류는 시황 기사가 제 출처다 (유가 사건의 '[뉴욕유가] … 혼조'를 빼지 않도록)
+PRICE_CATS = {"MARKET_STRUCTURE", "OIL_ENERGY", "RATES_FED", "FX_GLOBAL", "CRYPTO", "INFLATION", "GROWTH_JOBS"}
 
 
 def log(msg):
     print(msg, flush=True)
+
+
+def clean_title(t):
+    """목록의 제목에 남은 HTML 기호(&apos; · 두 번 감싼 &amp;quot;)를 푼다."""
+    t = t or ""
+    for _ in range(2):
+        t = html.unescape(t)
+    return t.strip()
+
+
+def _words(s):
+    """낱말 앞 세 글자 집합 (조사 · 어미는 떼고, 두 글자 이상만). 되풀이 · 제목 겹침을 대강 보는 데 쓴다."""
+    out = set()
+    for w in re.findall(r"[가-힣A-Za-z0-9.]+", s or ""):
+        w = JOSA.sub("", w)
+        if len(w) >= 2:
+            out.add(w[:3])
+    return out
+
+
+def repeats(body):
+    """같은 사실을 되풀이한 문장 쌍 [(앞 문장, 뒤 문장)]."""
+    sents = [x.strip() for x in re.split(r"(?<=[.?!])\s+", body) if x.strip()]
+    ws = [_words(s) for s in sents]
+    out = []
+    for i in range(len(sents)):
+        for j in range(i + 1, len(sents)):
+            a, b = ws[i], ws[j]
+            if min(len(a), len(b)) >= 3 and len(a & b) / min(len(a), len(b)) >= REPEAT_SCORE:
+                out.append((sents[i], sents[j]))
+    return out
+
+
+def shown_sources(ev):
+    """글에 붙일 참고 기사. 시황 기사인데 제목이 사건과 낱말 하나 겹치지 않으면 뺀다 (사실 · 출처 수 세기에는 그대로 남는다)."""
+    key = _words(ev.get("title"))
+    out = []
+    for s in ev.get("sources", []):
+        t = clean_title(s.get("title"))
+        if ev.get("cat") not in PRICE_CATS and WRAP.search(t) and not (_words(t) & key):
+            continue
+        out.append({"no": s.get("no"), "title": t, "url": s.get("url"), "publishedAt": s.get("publishedAt")})
+    return out
 
 
 def _digits(text):
@@ -150,6 +202,11 @@ def check(post, ev, ok_set, bad_set, fact_text):
     bad_end = [x for x in sentences if not x.endswith("니다.")]
     if bad_end:
         issues.append(f"합니다체로 끝나지 않은 문장이 {len(bad_end)}개 있습니다 (예: '{bad_end[0][-20:]}')")
+    rep = repeats(body)
+    if rep:
+        a, b = rep[0]
+        issues.append(f"같은 사실을 되풀이한 문장이 {len(rep)}쌍 있습니다 (예: '{a[:30]}' / '{b[:30]}'). "
+                      "하나만 남기고, 분량이 줄어도 괜찮습니다")
     for rx, msg in BANNED:
         if rx.search(title + body):
             issues.append(msg)
@@ -158,7 +215,7 @@ def check(post, ev, ok_set, bad_set, fact_text):
     if OPINION.search(body):
         issues.append(f"평가 · 전망 말('{OPINION.search(body).group()}')을 썼습니다. 사실만 쓰세요")
     for s in ev.get("sources", []):                         # 기사 제목과 겹치는 표현 (본문은 없으므로 제목과 비교)
-        st = re.sub(r"\s+", " ", s.get("title") or "")
+        st = re.sub(r"\s+", " ", clean_title(s.get("title")))
         m = SequenceMatcher(None, st, title + " " + body).find_longest_match(0, len(st), 0, len(title) + 1 + len(body))
         if m.size >= 15:
             issues.append(f"기사 제목과 {m.size}자가 겹칩니다('{st[m.a:m.a + m.size]}'). 새 말로 쓰세요")
@@ -185,10 +242,12 @@ def write_one(ev, date):
     facts, agreed, single, ok_set, bad_set, fact_text = materials(ev)
     base = dict(title=ev["title"], cat=CAT_KO.get(ev.get("cat"), "그 밖"), date=date, facts=facts, agreed=agreed, single=single,
                 min_chars=MIN_CHARS, max_chars=MAX_CHARS, title_max=TITLE_MAX)
-    post, issues, tries = None, [], 0
+    post, issues, tries, used = None, [], 0, []
     for tries in range(1, WRITE_TRIES + 1):
         fix = FIX_BLOCK.format(issues="\n".join(f"- {i}" for i in issues), title=post["title"], body=post["body"]) if post else ""
         out = _generate(WRITE_PROMPT.format(fix=fix, **base))
+        if llm.stats.get("lastModel") and llm.stats["lastModel"] not in used:
+            used.append(llm.stats["lastModel"])
         if not isinstance(out, dict):
             issues = ["JSON 형식이 아닙니다"]
             continue
@@ -196,7 +255,7 @@ def write_one(ev, date):
         issues = check(post, ev, ok_set, bad_set, fact_text)
         if not issues:
             break
-    return post, issues, tries
+    return post, issues, tries, used
 
 
 def event_key(ev):
@@ -239,11 +298,11 @@ def main():
     log(f"⑤ 고르기: 사건 {len(es.get('events', []))}개 중 독립 출처 두 곳 이상 "
         f"{sum(1 for e in es.get('events', []) if not e.get('single'))}개, 이미 쓴 사건 빼고 {len(chosen)}편 쓰기 (목표 {n}편)")
     date = now.astimezone(KST)
-    date_s = f"{date.year}.{date.month}.{date.day}"
+    date_s = f"{date.year}년 {date.month}월 {date.day}일"
     stats = {"ok": 0, "failed": 0, "skipped": 0}
     for i, ev in enumerate(chosen):
         try:
-            post, issues, tries = write_one(ev, date_s)
+            post, issues, tries, used = write_one(ev, date_s)
         except llm.LLMError as e:
             stats["skipped"] += 1
             log(f"⑥ {i + 1}편: Gemini 실패로 건너뜀 ({e})")
@@ -254,12 +313,11 @@ def main():
         stats["ok" if not issues else "failed"] += 1
         db.collection("posts").document(f"{run_id}-{i + 1}").set({
             "status": status, "title": post["title"] if post else "", "body": post["body"] if post else "",
-            "issues": issues, "tries": tries, "models": WRITE_MODELS,
+            "issues": issues, "tries": tries, "models": used,
             "eventTitle": ev["title"], "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
             "sourceCount": ev.get("sourceCount"), "outlets": ev.get("outlets", []),
             "agreedNumbers": [n for n in ev.get("numbers", []) if n.get("agreed")],
-            "sources": [{"no": s.get("no"), "title": s.get("title"), "url": s.get("url"), "publishedAt": s.get("publishedAt")}
-                        for s in ev.get("sources", [])],
+            "sources": shown_sources(ev),
             "eventKey": event_key(ev), "edition": es.get("edition"), "run": str(run_id), "createdAt": now,
         })
         log(f"⑥ ⑦ {i + 1}편: {status} (시도 {tries}번, 걸린 것 {len(issues)}개)")

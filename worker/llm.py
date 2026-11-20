@@ -107,7 +107,9 @@ def _with_model(model, prompt, max_out, has_next, gap=GAP, temperature=0, attemp
         code, text, finish = _call(model, prompt, max_out, gap, temperature)
         if code == 200:
             try:
-                return extract_json(text)
+                out = extract_json(text)
+                stats["lastModel"] = model         # 실제로 답한 모델 (write.py가 글마다 적는다)
+                return out
             except ValueError:
                 # 끝난 이유를 붙인다: MAX_TOKENS면 답이 잘린 것, STOP이면 형식이 틀린 것 (응답 원문은 남기지 않는다)
                 last = f"JSON 깨짐({finish or '이유 없음'})"
