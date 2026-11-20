@@ -1,6 +1,7 @@
 {
   "plan": [
-    {"name": "예시 · 첫 화면", "todo": "목업 확인 → 렌더러 반영 → 배포(묻고)", "files": ["example/*"]}
+    {"name": "예시 · 첫 화면", "todo": "목업 확인 → 렌더러 반영 → 배포(묻고)", "files": ["example/*"]},
+    {"name": "운영자 페이지 · 초안 굵게", "todo": "목업 확인 → 적용해 → 배포(묻고) + write.py 굵게 푸시", "files": ["admin/mock_posts.html"]}
   ],
   "live": [
     {"name": "운영자 페이지", "files": ["admin/*"]}

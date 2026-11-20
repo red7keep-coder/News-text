@@ -27,7 +27,8 @@ DEDUP_HOURS = 48
 BUSY_WAIT = 300            # Gemini 혼잡(503)이면 5분 쉬고
 BUSY_ROUNDS = 2            # 두 번까지 다시
 MIN_CHARS, MAX_CHARS = 300, 900   # 600자 하한은 재료가 적은 사건에서 같은 말 되풀이를 낳았다 (11-20)
-REPEAT_SCORE = 0.6                # 두 문장의 낱말이 이만큼 겹치면 되풀이로 본다 (11-20 초안 두 편으로 맞춤)
+BOLD_MIN, BOLD_MAX, BOLD_PARA, BOLD_LEN = 2, 6, 2, 20   # 굵게(**…**): 핵심 숫자 · 사건 요지만 (11-20)
+REPEAT_SCORE = 0.6               # 두 문장의 낱말이 이만큼 겹치면 되풀이로 본다 (11-20 초안 두 편으로 맞춤)
 TITLE_MAX = 48
 
 CAT_KO = {
@@ -42,7 +43,7 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 
 사건: {title}
 분류: {cat}
-기준일: {date}
+기준일: {date} (글에서는 '{day}일'로 씁니다)
 
 재료 (사실, 괄호는 그 사실을 쓴 독립 출처 수):
 {facts}
@@ -59,7 +60,11 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 - 문체: 본문은 합니다체(-했습니다 · -입니다)로 끝냅니다. 모든 문장이 '니다.'로 끝나야 합니다.
 - 제목: 헤드라인체. 명사형으로 끝내고 마침표 없이 {title_max}자 이내.
 - 숫자: '쓸 수 있는 숫자'만 값 그대로 씁니다. 계산 · 반올림 · 환산을 하지 않습니다. 숫자가 없으면 숫자 없이 씁니다.
-  날짜는 '19일'처럼 씁니다. 기준일과 달이 다르면 '10월 31일', 해가 다르면 '2027년 6월 30일'처럼 씁니다.
+- 날짜: 재료의 '때'에 적힌 꼴 그대로 씁니다. 이번 달은 '19일'처럼 일만, 올해 다른 달은 '10월 31일', 다른 해만 '2027년 6월 30일'.
+  올해 연도와 이번 달은 쓰지 않습니다. 가까운 문장에 같은 날짜가 또 나와도 '20일'처럼 짧게 씁니다.
+  '~ 기준으로 ~했습니다'는 '19일 기준 ~였습니다'처럼 줄여 씁니다.
+- 사람: 한국 사람은 '기관 · 부서 이름 직함' 순서로 씁니다. 예: '산업통상부 무역투자 강감찬 실장은' (O) / '강감찬 산업통상부 무역투자실장은' (X).
+  대통령 · 총리 · 이름난 기업 총수처럼 널리 알려진 사람이 아니면 이름을 굵게 하지 않습니다.
 - 사실만 씁니다. 전망 · 평가 · 비유 · 기자 해석을 더하지 않습니다(좋다 · 우려 · 기대감 · 호재 · 악재 같은 말 금지).
 - 매수 · 매도 · 추천 같은 투자 권유를 쓰지 않습니다.
 - 재료의 문장을 그대로 옮기지 말고 새 문장으로 씁니다. 언론사 이름을 쓰지 않습니다.
@@ -67,6 +72,9 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 - 약어는 한글로 풀고 괄호에 둡니다(주당순이익(EPS)). AI · ETF · CPI 같은 널리 쓰는 이름은 그대로.
 - '섹터' · '닿다'라는 말, '이 사건' 같은 지시어를 쓰지 않습니다. 이름을 그대로 씁니다.
 - 출처 · 면책 · AI 고지 꼬리말을 붙이지 않습니다.
+- 굵게: 본문에서 핵심 숫자('쓸 수 있는 숫자')와 사건의 요지(결정 · 결과를 나타내는 짧은 말)만 **이렇게** 감쌉니다.
+  글 전체 {bold_min} ~ {bold_max}곳, 한 문단에 {bold_para}곳까지. 한 곳은 {bold_len}자 이내의 낱말 · 짧은 구로, 문장 전체를 감싸지 않습니다. 제목에는 쓰지 않습니다.
+  예: 올해 누적 수출액이 **1조 달러**를 넘어섰습니다. / 자회사 KT HCN을 **흡수합병**하기로 했습니다.
 {fix}
 JSON만 답하세요: {{"title":"제목","body":"본문"}}
 """
@@ -119,6 +127,32 @@ def _words(s):
     return out
 
 
+BOLD = re.compile(r"\*\*(.+?)\*\*")
+
+
+def plain(body):
+    """굵게 표시(**)를 뗀 본문."""
+    return BOLD.sub(r"\1", body or "")
+
+
+def check_bold(title, body):
+    """굵게 표시 검사: 짝 · 개수 · 문단당 개수 · 길이 · 제목에 쓰지 않기."""
+    issues = []
+    if "**" in title:
+        issues.append("제목에는 굵게(**)를 쓰지 마세요")
+    if body.count("**") % 2:
+        return issues + ["굵게 표시(**)의 짝이 맞지 않습니다"]
+    spans = BOLD.findall(body)
+    if not BOLD_MIN <= len(spans) <= BOLD_MAX:
+        issues.append(f"굵게 표시가 {len(spans)}곳입니다. 핵심 숫자 · 사건 요지만 {BOLD_MIN} ~ {BOLD_MAX}곳으로 맞추세요")
+    if any(len(BOLD.findall(p)) > BOLD_PARA for p in re.split(r"\n\s*\n", body)):
+        issues.append(f"한 문단에 굵게 표시가 {BOLD_PARA}곳을 넘습니다")
+    long_ = [s for s in spans if len(s) > BOLD_LEN or s.rstrip().endswith(("니다", "."))]
+    if long_:
+        issues.append(f"굵게 표시가 너무 깁니다('{long_[0][:20]}'). 낱말 · 짧은 구만 감싸세요")
+    return issues
+
+
 def repeats(body):
     """같은 사실을 되풀이한 문장 쌍 [(앞 문장, 뒤 문장)]."""
     sents = [x.strip() for x in re.split(r"(?<=[.?!])\s+", body) if x.strip()]
@@ -159,8 +193,32 @@ def shell_fact(f, ok_values):
     return not re.search(r"\d", DATE_WORD.sub("", w))
 
 
-def materials(ev):
-    """(사실 줄, 쓸 숫자 줄, 쓰면 안 되는 숫자 줄, 쓸 숫자 집합, 한 곳 숫자 집합, 사실 글 전체)."""
+def day_word(when, today):
+    """'2026-11-19' → 이번 달 '19일' · 올해 '10월 31일' · 다른 해 '2027년 6월 30일'. 모르는 꼴은 그대로."""
+    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", (when or "").strip())
+    if not m or not today:
+        return when
+    y, mo, d = map(int, m.groups())
+    if y != today.year:
+        return f"{y}년 {mo}월 {d}일"
+    return f"{d}일" if mo == today.month else f"{mo}월 {d}일"
+
+
+def check_dates(text, today):
+    """올해 연도 · 이번 달을 붙인 날짜 (11-20 사용자: '2026년 11월 20일' 말고 '20일')."""
+    issues = []
+    for m in re.finditer(r"(?:(\d{4})년\s*)?(\d{1,2})월\s*(\d{1,2})일", text):
+        y, mo = int(m.group(1) or today.year), int(m.group(2))
+        if y == today.year and (m.group(1) or mo == today.month):
+            short = f"{m.group(3)}일" if mo == today.month else f"{mo}월 {m.group(3)}일"
+            issues.append(f"날짜 '{m.group()}'는 '{short}'처럼 쓰세요 (올해 연도 · 이번 달은 쓰지 않습니다)")
+            break
+    return issues
+
+
+def materials(ev, today=None):
+    """(사실 줄, 쓸 숫자 줄, 쓰면 안 되는 숫자 줄, 쓸 숫자 집합, 한 곳 숫자 집합, 사실 글 전체).
+    today를 주면 사실의 때를 '19일'처럼 바꿔 넣는다 (글에도 그 꼴로 쓰게)."""
     seen, facts = [], []
     ok_values = {n["value"] for n in ev.get("numbers", []) if n.get("agreed")}
     for f in ev.get("facts", []):
@@ -170,7 +228,7 @@ def materials(ev):
         seen.append(w)
         extra = []
         if f.get("when"):
-            extra.append(f"때 : {f['when']}")
+            extra.append(f"때 : {day_word(f['when'], today)}")
         if f.get("stage") == "discussing":
             extra.append("아직 정해지지 않음")
         if f.get("quote") and f["quote"].get("text"):
@@ -186,12 +244,16 @@ def materials(ev):
             ok_set, bad_set, fact_text)
 
 
-def check(post, ev, ok_set, bad_set, fact_text):
+def check(post, ev, ok_set, bad_set, fact_text, today=None):
     """검사에 걸린 것 [문장]. 빈 목록이면 통과."""
     issues = []
-    title, body = (post.get("title") or "").strip(), (post.get("body") or "").strip()
-    if not title or not body:
+    title, raw = (post.get("title") or "").strip(), (post.get("body") or "").strip()
+    if not title or not raw:
         return ["제목이나 본문이 비었습니다"]
+    issues += check_bold(title, raw)
+    body = plain(raw)                                        # 나머지 검사는 ** 를 뗀 글로
+    if today:
+        issues += check_dates(title + " " + body, today)
     n = len(body.replace("\n", ""))
     if n < MIN_CHARS or n > MAX_CHARS:
         issues.append(f"본문이 {n}자입니다. {MIN_CHARS} ~ {MAX_CHARS}자로 맞추세요")
@@ -252,10 +314,13 @@ def _generate(prompt):
             time.sleep(BUSY_WAIT)
 
 
-def write_one(ev, date):
-    facts, agreed, single, ok_set, bad_set, fact_text = materials(ev)
-    base = dict(title=ev["title"], cat=CAT_KO.get(ev.get("cat"), "그 밖"), date=date, facts=facts, agreed=agreed, single=single,
-                min_chars=MIN_CHARS, max_chars=MAX_CHARS, title_max=TITLE_MAX)
+def write_one(ev, today):
+    facts, agreed, single, ok_set, bad_set, fact_text = materials(ev, today)
+    date = f"{today.year}년 {today.month}월 {today.day}일"
+    base = dict(title=ev["title"], cat=CAT_KO.get(ev.get("cat"), "그 밖"), date=date, day=today.day,
+                facts=facts, agreed=agreed, single=single,
+                min_chars=MIN_CHARS, max_chars=MAX_CHARS, title_max=TITLE_MAX,
+                bold_min=BOLD_MIN, bold_max=BOLD_MAX, bold_para=BOLD_PARA, bold_len=BOLD_LEN)
     post, issues, tries, used = None, [], 0, []
     for tries in range(1, WRITE_TRIES + 1):
         fix = FIX_BLOCK.format(issues="\n".join(f"- {i}" for i in issues), title=post["title"], body=post["body"]) if post else ""
@@ -266,7 +331,7 @@ def write_one(ev, date):
             issues = ["JSON 형식이 아닙니다"]
             continue
         post = {"title": str(out.get("title") or "").strip(), "body": str(out.get("body") or "").strip()}
-        issues = check(post, ev, ok_set, bad_set, fact_text)
+        issues = check(post, ev, ok_set, bad_set, fact_text, today)
         if not issues:
             break
     return post, issues, tries, used
@@ -311,12 +376,11 @@ def main():
     chosen = pick(es.get("events", []), recent, n)
     log(f"⑤ 고르기: 사건 {len(es.get('events', []))}개 중 독립 출처 두 곳 이상 "
         f"{sum(1 for e in es.get('events', []) if not e.get('single'))}개, 이미 쓴 사건 빼고 {len(chosen)}편 쓰기 (목표 {n}편)")
-    date = now.astimezone(KST)
-    date_s = f"{date.year}년 {date.month}월 {date.day}일"
+    today = now.astimezone(KST)
     stats = {"ok": 0, "failed": 0, "skipped": 0}
     for i, ev in enumerate(chosen):
         try:
-            post, issues, tries, used = write_one(ev, date_s)
+            post, issues, tries, used = write_one(ev, today)
         except llm.LLMError as e:
             stats["skipped"] += 1
             log(f"⑥ {i + 1}편: Gemini 실패로 건너뜀 ({e})")
