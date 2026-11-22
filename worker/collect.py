@@ -97,12 +97,13 @@ FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내�
 - direction은 그 사실이 관련 종목 · 업종 · 자산 가격에 주는 방향(기사에 드러난 대로) up / down / neutral. 모르면 neutral.
 - 매수 · 매도를 권하는 말을 만들지 마세요.
 - 숫자는 기사에 적힌 값 그대로(단위 포함). 계산하거나 반올림하지 마세요.
+- when은 기사에 적힌 만큼만 씁니다. 연월만 있으면 YYYY-MM, 연도만 있으면 YYYY. 없는 월 · 일을 01로 채우지 마세요.
 - 숫자가 알맹이인 사실은 what에 숫자를 넣으세요. "자산총계 · 실적이 공개되었다"처럼 무엇이 나왔다는 말만 있는 문장은 쓰지 마세요.
 - 기사 하나에 사실 1 ~ 8개. 사실이 없는 기사(칼럼 · 목록 기사 등)는 facts를 빈 배열로.
 - cat은 다음 분류 코드 중 하나: {cats}
 
 JSON만 답하세요:
-{{"articles":[{{"id":"기사 id","facts":[{{"what":"","who":"","when":"YYYY-MM-DD 또는 빈 값",
+{{"articles":[{{"id":"기사 id","facts":[{{"what":"","who":"","when":"YYYY-MM-DD · YYYY-MM · YYYY 또는 빈 값",
 "numbers":[{{"name":"","value":"","unit":"","kind":"발표|예상|기타"}}],
 "quote":{{"speaker":"","text":""}} 또는 null,
 "stocks":[{{"name":"","code":"6자리 종목코드 또는 빈 값"}}],

@@ -46,4 +46,7 @@ jobs:
           GCP_PROJECT: ${{ vars.GCP_PROJECT }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_WRITE_MODELS: ${{ vars.GEMINI_WRITE_MODELS }}
+          GEMINI_CHECK_MODELS: ${{ vars.GEMINI_CHECK_MODELS }}
+          BLOG_PROJECT: ${{ vars.BLOG_PROJECT }}
+          BLOG_DATABASE: ${{ vars.BLOG_DATABASE }}
           WRITE_MAX: ${{ inputs.write_max }}

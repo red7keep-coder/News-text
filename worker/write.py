@@ -4,13 +4,18 @@
   ⑥ 쓰기    사건의 사실 목록과 '독립 출처 두 곳 이상이 맞춘 숫자'만 재료로 준다. 기사 본문은 주지 않는다
   ⑦ 검사    재료에 없는 숫자 · 한 곳만 쓴 숫자 · 매수 · 매도 권유 · 기사 제목과 겹침 · 문체 · 분량을 코드로 보고,
             걸리면 이유를 붙여 고쳐 쓰게 한다 (쓰기 포함 최대 WRITE_TRIES번)
+  ⑦-2 사실 확인  검사를 통과한 글을 Flash Lite가 문장마다 재료와 견준다. 근거 없는 문장은 코드가 지우고(다시 쓰지 않음),
+            지운 뒤 다시 검사해 분량 등이 모자라면 '검사 실패'. 제목에 근거 없는 내용이 있으면 '검사 실패'
   ⑧ 저장    posts/{id}: 통과하면 status '초안', 끝내 못 넘으면 '검사 실패'와 이유. 참고 기사 링크는 sources로 따로 둔다
+            '초안'은 블로그 저장소(BLOG_PROJECT)의 posts/{id}에도 글 칸만 쓴다 — 참고 기사 · 언론사 · 재료는 넘기지 않는다 (11-22 사용자)
 
 공개 로그에는 건수 · 상태만 찍는다. 재료 · 글 · 제목 · 주소는 찍지 않는다 (기획안 3절).
 모델: GEMINI_WRITE_MODELS (기본 gemini-4-hydrogen → gemini-3.6-flash). 둘 다 하루 20회 · 분당 5회.
+사실 확인: GEMINI_CHECK_MODELS (기본 gemini-3.5-flash-lite → gemini-3.1-flash-lite). 하루 500회.
 """
 import html
 import os
+from collections import Counter
 import re
 import time
 from datetime import datetime, timedelta, timezone
@@ -21,16 +26,22 @@ import llm
 KST = timezone(timedelta(hours=9))
 WRITE_MODELS = [m.strip() for m in (os.environ.get("GEMINI_WRITE_MODELS") or "gemini-4-hydrogen,gemini-3.6-flash").split(",")
                 if m.strip()]
+CHECK_MODELS = [m.strip() for m in (os.environ.get("GEMINI_CHECK_MODELS") or "gemini-3.5-flash-lite,gemini-3.1-flash-lite").split(",")
+                if m.strip()]
 WRITE_GAP = 13             # 분당 5회 한도
 WRITE_TRIES = 3            # 쓰기 + 고쳐 쓰기 2번
 DEDUP_HOURS = 48
 BUSY_WAIT = 300            # Gemini 혼잡(503)이면 5분 쉬고
 BUSY_ROUNDS = 2            # 두 번까지 다시
 MIN_CHARS, MAX_CHARS = 300, 900   # 600자 하한은 재료가 적은 사건에서 같은 말 되풀이를 낳았다 (11-20)
+FACT_MIN_CHARS = 200              # 사실 확인으로 문장을 지운 글의 하한 (11-22: 300이면 지운 글 5편이 모두 떨어졌다)
 BOLD_MIN, BOLD_MAX, BOLD_PARA, BOLD_LEN = 2, 6, 2, 20   # 굵게(**…**): 핵심 숫자 · 사건 요지만 (11-20)
 DAY_MAX = 2                                                # 같은 날짜는 본문에 두 번까지 (11-20)
 REPEAT_SCORE = 0.6               # 두 문장의 낱말이 이만큼 겹치면 되풀이로 본다 (11-20 초안 두 편으로 맞춤)
 TITLE_MAX = 48
+SLUG_WORDS = (3, 6)
+STOCKS_MAX = 3            # 블로그 비교 칸에 넘길 종목 수 (11-22 블로그 Q1)
+BLOG_VERSION = 1
 
 CAT_KO = {
     "RATES_FED": "금리 · 중앙은행", "INFLATION": "물가", "GROWTH_JOBS": "경기 · 고용", "TARIFF_TRADE": "관세 · 무역",
@@ -79,8 +90,10 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 - 굵게: 본문에서 핵심 숫자('쓸 수 있는 숫자')와 사건의 요지(결정 · 결과를 나타내는 짧은 말)만 **이렇게** 감쌉니다.
   글 전체 {bold_min} ~ {bold_max}곳, 한 문단에 {bold_para}곳까지. 한 곳은 {bold_len}자 이내의 낱말 · 짧은 구로, 문장 전체를 감싸지 않습니다. 제목에는 쓰지 않습니다.
   예: 올해 누적 수출액이 **1조 달러**를 넘어섰습니다. / 자회사 KT HCN을 **흡수합병**하기로 했습니다.
+- slug: 블로그 글 주소로 쓸 영문 이름. 영문 소문자 · 숫자 · 하이픈만, 3 ~ 6낱말. 회사 · 기관은 널리 쓰는 영문 이름으로.
+  예: sk-hynix-kioxia-stake / korea-exports-top-1-trillion
 {fix}
-JSON만 답하세요: {{"title":"제목","body":"본문"}}
+JSON만 답하세요: {{"title":"제목","body":"본문","slug":"영문-주소"}}
 """
 
 FIX_BLOCK = """
@@ -89,6 +102,29 @@ FIX_BLOCK = """
 지난번 글:
 제목: {title}
 본문: {body}
+"""
+
+FACT_PROMPT = """당신은 사실 확인 담당입니다. 아래 '글'의 제목과 문장마다, 그 내용이 '재료'에 근거가 있는지 판단하세요.
+당신이 알고 있는 지식은 쓰지 마세요. 사실이라도 재료에 없으면 근거 없음입니다.
+
+재료 (번호가 붙은 사실):
+{facts}
+
+재료 (쓸 수 있는 숫자):
+{agreed}
+
+글 (0번은 제목, 1번부터 본문 문장):
+{sents}
+
+판단 기준:
+- 근거 있음: 문장의 모든 내용(누가 · 무엇을 · 언제 · 숫자 · 방향 · 이유)이 재료의 사실 하나 이상에 들어 있다. 말을 바꿔 쓴 것은 괜찮다.
+- 근거 없음: 재료에 없는 내용(배경 설명 · 이유 · 해석 · 앞으로의 계획 · 다른 사람이나 기관 이름)이 하나라도 들어 있거나, 재료와 어긋난다(사람 · 기관 · 방향 · 숫자가 다름).
+- 재료보다 덜 쓴 것은 문제가 아니다. 재료의 세부 내용(숫자 · 이름의 일부)을 빼고 쓴 문장은 근거 있음이다. 제목은 짧게 줄인 말이다.
+- 재료에 있는 내용을 일반적인 말로 묶은 것은 괜찮다. 예: 코스피 · 코스닥 → '국내 증시', 나스닥 · 다우 → '미국 증시', 'HLRE-5' → 'HLRE'.
+- 날짜 표기만 다른 것(19일 · 11월 19일 · 2026.11.19)은 같은 날짜로 본다.
+- 재료에 '아직 정해지지 않음'인 일을 정해진 일처럼 쓰면 근거 없음이다.
+
+JSON만 답하세요: {{"items":[{{"n":번호,"ok":true 또는 false,"facts":[근거 사실 번호],"why":"근거 없음이면 재료에 없는 부분을 짧게"}}]}}
 """
 
 # 투자 권유 · 평가어 (사실 보도에 쓰이는 '순매수 · 순매도 · 매수세 · 매도세 · 매수 의견'은 뺀다)
@@ -187,8 +223,14 @@ def shown_sources(ev):
     return out
 
 
+def _num(n):
+    """숫자 조각을 비교용으로: 쉼표를 떼고, 정수의 앞자리 0을 뗀다 (재료 '2000-01-01'의 01 = 본문 '1월'의 1, 11-22)."""
+    n = n.replace(",", "")
+    return n if "." in n else (n.lstrip("0") or "0")
+
+
 def _digits(text):
-    return {n.replace(",", "") for n in NUM.findall(text or "")}
+    return {_num(n) for n in NUM.findall(text or "")}
 
 
 def shell_fact(f, ok_values):
@@ -203,11 +245,18 @@ def shell_fact(f, ok_values):
 
 
 def day_word(when, today):
-    """'2026-11-19' → 이번 달 '19일' · 올해 '10월 31일' · 다른 해 '2027년 6월 30일'. 모르는 꼴은 그대로."""
-    m = re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", (when or "").strip())
+    """'2026-11-19' → 이번 달 '19일' · 올해 '10월 31일' · 다른 해 '2027년 6월 30일'. 모르는 꼴은 그대로.
+    연월만('2000-05') · 연도만('2000') 있는 때는 있는 만큼만 쓴다 (11-22: 연도만 있던 때가 '1월 1일'로 채워졌다)."""
+    m = re.fullmatch(r"(\d{4})(?:-(\d{1,2}))?(?:-(\d{1,2}))?", (when or "").strip())
     if not m or not today:
         return when
-    y, mo, d = map(int, m.groups())
+    y = int(m.group(1))
+    if not m.group(2):
+        return f"{y}년"
+    mo = int(m.group(2))
+    if not m.group(3):
+        return f"{y}년 {mo}월" if y != today.year else f"{mo}월"
+    d = int(m.group(3))
     if y != today.year:
         return f"{y}년 {mo}월 {d}일"
     return f"{d}일" if mo == today.month else f"{mo}월 {d}일"
@@ -299,7 +348,7 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
         text = DATE.sub(" ", text)                         # 2026.11.19 같은 날짜 표기는 숫자 검사에서 뺀다
         text = NAME_NUM.sub(" ", text)                     # 지수 · 제품 이름 속 숫자도 뺀다
         for m in NUM.finditer(text):
-            v = m.group().replace(",", "")
+            v = _num(m.group())
             if v in ok_set:
                 continue
             after = text[m.end():m.end() + 4]
@@ -353,6 +402,71 @@ def _generate(prompt):
             time.sleep(BUSY_WAIT)
 
 
+def split_body(raw):
+    """본문을 [(문단 번호, 문장)]으로. 굵게 표시(**)는 그대로 둔다 (굵게는 문장을 넘지 않는다 · check_bold)."""
+    out = []
+    paras = [x for x in re.split(r"\n\s*\n", raw or "") if x.strip()]
+    for pi, para in enumerate(paras):
+        out += [(pi, x.strip()) for x in re.split(r"(?<=[.?!])\s+", para.strip()) if x.strip()]
+    return out
+
+
+def drop_sentences(sents, drop):
+    """drop(문장 번호 집합)을 뺀 본문. 비는 문단은 없앤다."""
+    paras = {}
+    for i, (pi, x) in enumerate(sents):
+        if i not in drop:
+            paras.setdefault(pi, []).append(x)
+    return "\n\n".join(" ".join(v) for _, v in sorted(paras.items()))
+
+
+def fact_check(post, facts, agreed):
+    """⑦-2 사실 확인 (Flash Lite). → (문장 목록, 제목이 걸린 이유 또는 '', [(문장 번호, 이유)])."""
+    sents = split_body(post["body"])
+    fact_lines = "\n".join(f"{i + 1}. {line[2:]}" for i, line in enumerate(facts.splitlines()))
+    lines = "\n".join([f"0. {post['title']}"] + [f"{i + 1}. {plain(x)}" for i, (_, x) in enumerate(sents)])
+    out = llm.generate_json(FACT_PROMPT.format(facts=fact_lines, agreed=agreed, sents=lines),
+                            max_out=8192, models=CHECK_MODELS)
+    items = out if isinstance(out, list) else out.get("items") if isinstance(out, dict) else None
+    if not isinstance(items, list):
+        raise llm.LLMError("사실 확인 답이 형식에 맞지 않음")
+    title_bad, bad = "", []
+    for it in items:
+        if not isinstance(it, dict) or it.get("ok") is not False or not isinstance(it.get("n"), int):
+            continue
+        why = str(it.get("why") or "재료에 없음")[:120]
+        if it["n"] == 0:
+            title_bad = why
+        elif 1 <= it["n"] <= len(sents):
+            bad.append((it["n"] - 1, why))
+    return sents, title_bad, bad
+
+
+def slugify(raw):
+    """모델이 준 slug를 꼴에 맞춘다: 영문 소문자 · 숫자 · 하이픈, 6낱말까지. 3낱말이 안 되면 ''."""
+    words = re.findall(r"[a-z0-9]+", (raw or "").lower())[:SLUG_WORDS[1]]
+    return "-".join(words) if len(words) >= SLUG_WORDS[0] else ""
+
+
+def top_stocks(ev):
+    """사실들의 종목을 많이 나온 순으로 STOCKS_MAX개 [{name, code}]. 코드는 AI가 뽑은 값이라 블로그가 자기 목록과 맞춰 본다."""
+    cnt, info = Counter(), {}
+    for f in ev.get("facts", []):
+        for st in f.get("stocks") or []:
+            name = (st.get("name") or "").strip()
+            if not name:
+                continue
+            cnt[name] += 1
+            d = info.setdefault(name, {"name": name, "code": ""})
+            d["code"] = d["code"] or st.get("code") or ""
+    return [info[n] for n, _ in cnt.most_common(STOCKS_MAX)]
+
+
+def top_sector(ev):
+    cnt = Counter((f.get("sector") or "").strip() for f in ev.get("facts", []) if (f.get("sector") or "").strip())
+    return cnt.most_common(1)[0][0] if cnt else ""
+
+
 def write_one(ev, today):
     facts, agreed, single, ok_set, bad_set, fact_text = materials(ev, today)
     date = f"{today.year}년 {today.month}월 {today.day}일"
@@ -369,11 +483,28 @@ def write_one(ev, today):
         if not isinstance(out, dict):
             issues = ["JSON 형식이 아닙니다"]
             continue
-        post = {"title": str(out.get("title") or "").strip(), "body": str(out.get("body") or "").strip()}
+        post = {"title": str(out.get("title") or "").strip(), "body": str(out.get("body") or "").strip(),
+                "slug": slugify(str(out.get("slug") or ""))}
         issues = check(post, ev, ok_set, bad_set, fact_text, today)
         if not issues:
             break
-    return post, issues, tries, used
+    fact = {"removed": [], "model": ""}
+    if post and not issues:                                   # ⑦-2 사실 확인: 다시 쓰지 않고 근거 없는 문장만 지운다
+        try:
+            sents, title_bad, bad = fact_check(post, facts, agreed)
+            fact["model"] = llm.stats.get("lastModel") or ""
+            if title_bad:
+                issues = [f"사실 확인: 제목에 재료에 없는 내용이 있습니다 ({title_bad})"]
+            elif bad:
+                fact["removed"] = [{"sentence": plain(sents[i][1]), "why": why} for i, why in bad]
+                post = dict(post, body=drop_sentences(sents, {i for i, _ in bad}))
+                n = len(plain(post["body"]).replace("\n", ""))
+                issues = [f"사실 확인 뒤: {x}" for x in check(post, ev, ok_set, bad_set, fact_text, today)
+                          if not (x.startswith("굵게 표시가 ") and "곳입니다" in x)       # 지운 탓에 굵게가 모자란 것,
+                          and not (x.startswith("본문이 ") and FACT_MIN_CHARS <= n <= MAX_CHARS)]   # 짧아진 것은 괜찮다
+        except llm.LLMError as e:
+            issues = [f"사실 확인을 못 했습니다 ({e})"]       # 확인 못 한 글은 블로그에 넘기지 않는다
+    return post, issues, tries, used, fact
 
 
 def event_key(ev):
@@ -393,11 +524,28 @@ def pick(events, recent_keys, n):
     return out
 
 
+def to_blog(blog_db, doc_id, post, ev, today, now):
+    """블로그가 읽는 저장소에 글 칸만 쓴다 (요청-알파스코프-뉴스-글-발행 7절 Q6). 참고 기사 · 언론사 · 재료 · eventKey는 넣지 않는다."""
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    col = blog_db.collection("posts")
+    base = post.get("slug") or f"news-{today:%Y%m%d}-{doc_id}"
+    slug, k = base, 2
+    while list(col.where(filter=FieldFilter("slug", "==", slug)).limit(1).stream()):
+        slug, k = f"{base}-{k}", k + 1
+    col.document(doc_id).set({
+        "title": post["title"], "body": post["body"], "date": today.strftime("%Y-%m-%d"), "createdAt": now,
+        "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
+        "stocks": top_stocks(ev), "sector": top_sector(ev), "slug": slug, "version": BLOG_VERSION,
+    })
+
+
 def main():
     from google.cloud import firestore
     from google.cloud.firestore_v1.base_query import FieldFilter
 
     db = firestore.Client(project=os.environ["GCP_PROJECT"])
+    blog_db = (firestore.Client(project=os.environ["BLOG_PROJECT"], database=os.environ.get("BLOG_DATABASE") or "(default)")
+               if os.environ.get("BLOG_PROJECT") else None)
     now = datetime.now(timezone.utc)
     run_id = os.environ.get("GITHUB_RUN_ID") or now.strftime("local-%Y%m%d%H%M%S")
     n = int(os.environ.get("WRITE_MAX") or (2 if now.astimezone(KST).hour < 12 else 3))   # 07:00 두 편 · 16:30 세 편
@@ -416,10 +564,10 @@ def main():
     log(f"⑤ 고르기: 사건 {len(es.get('events', []))}개 중 독립 출처 두 곳 이상 "
         f"{sum(1 for e in es.get('events', []) if not e.get('single'))}개, 이미 쓴 사건 빼고 {len(chosen)}편 쓰기 (목표 {n}편)")
     today = now.astimezone(KST)
-    stats = {"ok": 0, "failed": 0, "skipped": 0}
+    stats = {"ok": 0, "failed": 0, "skipped": 0, "blog": 0}
     for i, ev in enumerate(chosen):
         try:
-            post, issues, tries, used = write_one(ev, today)
+            post, issues, tries, used, fact = write_one(ev, today)
         except llm.LLMError as e:
             stats["skipped"] += 1
             log(f"⑥ {i + 1}편: Gemini 실패로 건너뜀 ({e})")
@@ -428,8 +576,10 @@ def main():
             continue
         status = "초안" if not issues else "검사 실패"
         stats["ok" if not issues else "failed"] += 1
-        db.collection("posts").document(f"{run_id}-{i + 1}").set({
+        doc_id = f"{run_id}-{i + 1}"
+        db.collection("posts").document(doc_id).set({
             "status": status, "title": post["title"] if post else "", "body": post["body"] if post else "",
+            "slug": post.get("slug", "") if post else "", "factRemoved": fact["removed"], "factModel": fact["model"],
             "issues": issues, "tries": tries, "models": used,
             "eventTitle": ev["title"], "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
             "sourceCount": ev.get("sourceCount"), "outlets": ev.get("outlets", []),
@@ -437,8 +587,15 @@ def main():
             "sources": shown_sources(ev),
             "eventKey": event_key(ev), "edition": es.get("edition"), "run": str(run_id), "createdAt": now,
         })
-        log(f"⑥ ⑦ {i + 1}편: {status} (시도 {tries}번, 걸린 것 {len(issues)}개)")
-    log(f"⑧ 저장: 초안 {stats['ok']}편, 검사 실패 {stats['failed']}편, 건너뜀 {stats['skipped']}편 · "
+        if not issues and blog_db is not None:
+            try:
+                to_blog(blog_db, doc_id, post, ev, today, now)
+                stats["blog"] += 1
+            except Exception as e:                          # 블로그 저장소가 안 돼도 수집기 글은 남는다
+                log(f"   블로그 저장소에 못 씀 ({type(e).__name__})")
+        log(f"⑥ ⑦ {i + 1}편: {status} (시도 {tries}번, 걸린 것 {len(issues)}개, 사실 확인으로 지운 문장 {len(fact['removed'])}개)")
+    log(f"⑧ 저장: 초안 {stats['ok']}편, 검사 실패 {stats['failed']}편, 건너뜀 {stats['skipped']}편, "
+        f"블로그 저장소 {stats['blog']}편" + ("" if blog_db is not None else "(BLOG_PROJECT 없음)") + " · "
         f"Gemini 호출 {llm.stats['calls']}번 {llm.stats['byModel']}" + (f", 오류 {llm.stats['errors']}" if llm.stats["errors"] else ""))
 
 
