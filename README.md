@@ -11,16 +11,23 @@
 
 ## 지금 단계
 
-1단계 사실 뽑기 (`worker/collect.py`, 하루 두 번 07:00 · 16:30 KST). 목록 → 제목으로 고르기 → 본문 받기 → 사실 뽑기 → 사건 묶기. 글은 아직 쓰지 않는다.
+하루 두 번(07:00 · 16:30 KST) `collect` 작업이 1단계 · 2단계를 이어서 돌린다.
+
+- **1단계 사실 뽑기** (`worker/collect.py`): 목록 → 제목으로 고르기 → 본문 받기 → 사실 뽑기 → 사건 묶기.
+- **2단계 글쓰기** (`worker/write.py`): 독립 출처 두 곳 이상인 사건을 골라, 사실 목록과 두 곳 이상이 맞춘 숫자만으로 글을 쓴다. 기사 본문은 주지 않는다. 코드 검사(재료에 없는 숫자 · 매수 · 매도 권유 · 제목 겹침 · 되풀이 · 분량 등)에 걸리면 고쳐 쓰게 하고, 결과는 Firestore `posts`에 '초안' 또는 '검사 실패'로 남긴다. 07:00 두 편 · 16:30 세 편. 아직 공개 발행은 하지 않는다.
 
 | 파일 | 하는 일 |
 | --- | --- |
 | `worker/net.py` | robots · 간격 · 목록(사이트맵 · RSS) · 본문 추출 |
+| `worker/robots.py` | robots.txt 읽기 |
 | `worker/llm.py` | Gemini 호출 (입력 · 응답 원문은 로그에 남기지 않음) |
 | `worker/collect.py` | 1단계 수집 |
+| `worker/write.py` | 2단계 글쓰기 · 검사 · 초안 저장 |
 | `worker/probe.py` | 0단계 접속 시험 (손으로만) |
+
+글쓰기만 따로 돌릴 때는 `write` 작업을 손으로 실행한다(`write_max`로 글 수 지정, 언론사에는 접속하지 않음).
 
 ## 설정
 
-- 저장소 변수(Variables): `GCP_PROJECT` · `WIF_PROVIDER` · `WIF_SERVICE_ACCOUNT`, 선택 `GEMINI_MODELS`(쉼표로, 비우면 `gemini-3.5-flash-lite,gemini-3.1-flash-lite`). Google Cloud에는 키 파일 없이 접속한다.
+- 저장소 변수(Variables): `GCP_PROJECT` · `WIF_PROVIDER` · `WIF_SERVICE_ACCOUNT`, 선택 `GEMINI_MODELS`(쉼표로, 비우면 `gemini-3.5-flash-lite,gemini-3.1-flash-lite`), 선택 `GEMINI_WRITE_MODELS`(글쓰기용, 비우면 `gemini-4-hydrogen,gemini-3.6-flash`). Google Cloud에는 키 파일 없이 접속한다.
 - 비밀 값(Secrets): `GEMINI_API_KEY`. 없으면 목록만 보고 끝낸다.
