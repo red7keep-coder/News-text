@@ -9,6 +9,10 @@
   ⑧ 저장    posts/{id}: 통과하면 status '초안', 끝내 못 넘으면 '검사 실패'와 이유. 참고 기사 링크는 sources로 따로 둔다
             '초안'은 블로그 저장소(BLOG_PROJECT)의 posts/{id}에도 글 칸만 쓴다 — 참고 기사 · 언론사 · 재료는 넘기지 않는다 (11-22 사용자)
 
+글 칸 (블로그 12절, version 2): title · summary(맨 앞 요약) · banner{titles, keys}(그림 위 제목 후보 · 아래 요약 낱말) · body · slug.
+  본문 강조는 **결과** 문단마다 1곳 · ==재료에 있는 이유== 0 ~ 2곳. 새 칸이 규칙을 어겨도 다시 쓰지 않는다(글쓰기 모델 하루 20회):
+  강조는 표시만 떼고, 배너는 숫자 든 후보를 빼고, 요약은 숫자 검사 · 사실 확인에 걸리면 비운다.
+
 공개 로그에는 건수 · 상태만 찍는다. 재료 · 글 · 제목 · 주소는 찍지 않는다 (기획안 3절).
 모델: GEMINI_WRITE_MODELS (기본 gemini-4-hydrogen → gemini-3.6-flash). 둘 다 하루 20회 · 분당 5회.
 사실 확인: GEMINI_CHECK_MODELS (기본 gemini-3.5-flash-lite → gemini-3.1-flash-lite). 하루 500회.
@@ -35,13 +39,15 @@ BUSY_WAIT = 300            # Gemini 혼잡(503)이면 5분 쉬고
 BUSY_ROUNDS = 2            # 두 번까지 다시
 MIN_CHARS, MAX_CHARS = 300, 900   # 600자 하한은 재료가 적은 사건에서 같은 말 되풀이를 낳았다 (11-20)
 FACT_MIN_CHARS = 200              # 사실 확인으로 문장을 지운 글의 하한 (11-22: 300이면 지운 글 5편이 모두 떨어졌다)
-BOLD_MIN, BOLD_MAX, BOLD_PARA, BOLD_LEN = 2, 6, 2, 20   # 굵게(**…**): 핵심 숫자 · 사건 요지만 (11-20)
+# 강조 (블로그 12절 R16, 11-22): **결과** 문단마다 1곳 · ==재료에 있는 이유== 문단마다 0 ~ 2곳. 어기면 고쳐 쓰지 않고 표시만 뗀다
+BOLD_PARA, HL_PARA, MARK_LEN = 1, 2, (2, 25)
+BANNER_TITLES, BANNER_KEYS = 3, 3      # 배너 제목 후보 · 아래 요약 낱말 수 (R13 · R14)
 DAY_MAX = 2                                                # 같은 날짜는 본문에 두 번까지 (11-20)
 REPEAT_SCORE = 0.6               # 두 문장의 낱말이 이만큼 겹치면 되풀이로 본다 (11-20 초안 두 편으로 맞춤)
 TITLE_MAX = 48
 SLUG_WORDS = (3, 6)
 STOCKS_MAX = 3            # 블로그 비교 칸에 넘길 종목 수 (11-22 블로그 Q1)
-BLOG_VERSION = 1
+BLOG_VERSION = 2          # 2: summary · banner · ==이유== 강조 (블로그 12절 Q18)
 
 CAT_KO = {
     "RATES_FED": "금리 · 중앙은행", "INFLATION": "물가", "GROWTH_JOBS": "경기 · 고용", "TARIFF_TRADE": "관세 · 무역",
@@ -87,13 +93,20 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 - 약어는 한글로 풀고 괄호에 둡니다(주당순이익(EPS)). AI · ETF · CPI 같은 널리 쓰는 이름은 그대로.
 - '섹터' · '닿다'라는 말, '이 사건' 같은 지시어를 쓰지 않습니다. 이름을 그대로 씁니다.
 - 출처 · 면책 · AI 고지 꼬리말을 붙이지 않습니다.
-- 굵게: 본문에서 핵심 숫자('쓸 수 있는 숫자')와 사건의 요지(결정 · 결과를 나타내는 짧은 말)만 **이렇게** 감쌉니다.
-  글 전체 {bold_min} ~ {bold_max}곳, 한 문단에 {bold_para}곳까지. 한 곳은 {bold_len}자 이내의 낱말 · 짧은 구로, 문장 전체를 감싸지 않습니다. 제목에는 쓰지 않습니다.
-  예: 올해 누적 수출액이 **1조 달러**를 넘어섰습니다. / 자회사 KT HCN을 **흡수합병**하기로 했습니다.
+- 강조 (본문에만 씁니다. 제목 · 요약 · 배너에는 쓰지 않습니다):
+  **결과**: 일어난 일 자체(결정 · 발표 · 핵심 숫자)를 나타내는 짧은 말을 문단마다 1곳 감쌉니다.
+  ==이유==: 재료에 있는 이유 · 배경(누가 밝힌 이유, 결정의 근거, 사건의 조건)을 나타내는 짧은 말을 문단마다 0 ~ 2곳 감쌉니다.
+  재료에 이유가 없으면 ==…==는 쓰지 않습니다. 당신의 해석 · 전망에는 쓰지 않습니다.
+  감싸는 말은 5 ~ 25자의 짧은 덩어리입니다. 문장 전체 · 사람 이름만 · 숫자 하나만은 감싸지 않고, 표시 안에 다른 표시를 넣지 않습니다.
+  예: 올해 누적 수출액이 **1조 달러를 돌파**했습니다. 산업통상부는 ==반도체 수출 증가==가 바탕이 됐다고 밝혔습니다.
+- summary: 글 맨 앞에 놓을 요약 1 ~ 2문장(합니다체, 100자 안팎). 사건의 요지만 씁니다. 본문 첫 문장을 그대로 되풀이하지 않고, 재료에 있는 것만 씁니다.
+- banner.titles: 그림 위 큰 제목 후보 2 ~ 3개, 좋은 것부터. 후보마다 ["첫 줄", "둘째 줄"] (첫 줄 = 무슨 일, 둘째 줄 = 결과).
+  줄마다 띄어쓰기 빼고 한글 10자 이내. 글 제목을 짧게 줄인 말이고 새 주장을 넣지 않습니다. 숫자 · % · 금액 · 줄표를 쓰지 않습니다.
+- banner.keys: 그림 아래 한 줄 요약 낱말 2 ~ 3개. 띄어쓰기 빼고 합쳐 20자 이내, 숫자 없음.
 - slug: 블로그 글 주소로 쓸 영문 이름. 영문 소문자 · 숫자 · 하이픈만, 3 ~ 6낱말. 회사 · 기관은 널리 쓰는 영문 이름으로.
   예: sk-hynix-kioxia-stake / korea-exports-top-1-trillion
 {fix}
-JSON만 답하세요: {{"title":"제목","body":"본문","slug":"영문-주소"}}
+JSON만 답하세요: {{"title":"제목","summary":"요약","banner":{{"titles":[["첫 줄","둘째 줄"]],"keys":["낱말","낱말"]}},"body":"본문","slug":"영문-주소"}}
 """
 
 FIX_BLOCK = """
@@ -113,7 +126,7 @@ FACT_PROMPT = """당신은 사실 확인 담당입니다. 아래 '글'의 제목
 재료 (쓸 수 있는 숫자):
 {agreed}
 
-글 (0번은 제목, 1번부터 본문 문장):
+글 (0번은 제목, 1번부터 본문 문장, '(요약)'이 붙은 줄은 글 맨 앞 요약):
 {sents}
 
 판단 기준:
@@ -173,29 +186,53 @@ def _words(s):
 
 
 BOLD = re.compile(r"\*\*(.+?)\*\*")
+HL = re.compile(r"==(.+?)==")
 
 
 def plain(body):
-    """굵게 표시(**)를 뗀 본문."""
-    return BOLD.sub(r"\1", body or "")
+    """강조 표시(** · ==)를 뗀 글."""
+    return HL.sub(r"\1", BOLD.sub(r"\1", body or "")).replace("**", "").replace("==", "")
 
 
-def check_bold(title, body):
-    """굵게 표시 검사: 짝 · 개수 · 문단당 개수 · 길이 · 제목에 쓰지 않기."""
-    issues = []
-    if "**" in title:
-        issues.append("제목에는 굵게(**)를 쓰지 마세요")
-    if body.count("**") % 2:
-        return issues + ["굵게 표시(**)의 짝이 맞지 않습니다"]
-    spans = BOLD.findall(body)
-    if not BOLD_MIN <= len(spans) <= BOLD_MAX:
-        issues.append(f"굵게 표시가 {len(spans)}곳입니다. 핵심 숫자 · 사건 요지만 {BOLD_MIN} ~ {BOLD_MAX}곳으로 맞추세요")
-    if any(len(BOLD.findall(p)) > BOLD_PARA for p in re.split(r"\n\s*\n", body)):
-        issues.append(f"한 문단에 굵게 표시가 {BOLD_PARA}곳을 넘습니다")
-    long_ = [s for s in spans if len(s) > BOLD_LEN or s.rstrip().endswith(("니다", "."))]
-    if long_:
-        issues.append(f"굵게 표시가 너무 깁니다('{long_[0][:20]}'). 낱말 · 짧은 구만 감싸세요")
-    return issues
+def tidy_marks(body):
+    """강조 표시를 규칙에 맞게 다듬는다 — 고쳐 쓰기 호출 없이 코드로 (블로그 12절 R16).
+    **결과** 문단마다 BOLD_PARA곳 · ==이유== HL_PARA곳까지. 짝 없음 · 겹침 · 너무 짧거나 긺 · 문장 전체 · 숫자 하나는
+    표시만 떼고 글자는 남긴다."""
+    out = []
+    for para in re.split(r"\n\s*\n", body or ""):
+        for mark in ("**", "=="):
+            if para.count(mark) % 2:
+                para = para.replace(mark, "")
+        cnt = {"**": 0, "==": 0}
+
+        def keep(m, mark, cap):
+            inner = m.group(1)
+            ok = (MARK_LEN[0] <= len(inner.strip()) <= MARK_LEN[1] and "**" not in inner and "==" not in inner
+                  and not inner.rstrip().endswith(("니다", ".")) and not re.search(r"[.?!]\s", inner)
+                  and not re.fullmatch(r"[\d,.%]+", inner.strip()))
+            if ok and cnt[mark] < cap:
+                cnt[mark] += 1
+                return f"{mark}{inner}{mark}"
+            return inner
+
+        para = BOLD.sub(lambda m: keep(m, "**", BOLD_PARA), para)
+        para = HL.sub(lambda m: keep(m, "==", HL_PARA), para)
+        out.append(re.sub(r"[ \t]{2,}", " ", para).strip())
+    return "\n\n".join(x for x in out if x)
+
+
+def tidy_banner(raw):
+    """배너 칸 (R13 · R14). 숫자 · % · 줄표 · 금지 말이 든 후보는 뺀다. 길이는 그대로 둔다(블로그가 맞는 후보를 고름)."""
+    b = raw if isinstance(raw, dict) else {}
+    titles = []
+    for cand in b.get("titles") if isinstance(b.get("titles"), list) else []:
+        lines = [cand] if isinstance(cand, str) else cand if isinstance(cand, list) else []
+        lines = [plain(str(x)).strip() for x in lines if str(x).strip()][:2]
+        if lines and not any(re.search(r"[\d%—–]", x) or ADVICE.search(x) or OPINION.search(x) for x in lines):
+            titles.append(lines)
+    keys = [plain(str(k)).strip() for k in (b.get("keys") if isinstance(b.get("keys"), list) else [])
+            if str(k).strip() and not re.search(r"\d", str(k))]
+    return {"titles": titles[:BANNER_TITLES], "keys": keys[:BANNER_KEYS]}
 
 
 def repeats(body):
@@ -326,14 +363,49 @@ def materials(ev, today=None):
             ok_set, bad_set, fact_text)
 
 
+def num_issues(text, where, ok_set, bad_set, fact_text):
+    """재료에 없는 숫자 · 한 곳만 쓴 숫자."""
+    issues = []
+    text = DATE.sub(" ", text)                         # 2026.11.19 같은 날짜 표기는 숫자 검사에서 뺀다
+    text = NAME_NUM.sub(" ", text)                     # 지수 · 제품 이름 속 숫자도 뺀다
+    for m in NUM.finditer(text):
+        v = _num(m.group())
+        if v in ok_set:
+            continue
+        after = text[m.end():m.end() + 4]
+        if TIME_UNIT.match(after) and v in _digits(fact_text):
+            continue                                   # 재료에 있는 날짜 · 분기 · 횟수
+        ctx = text[max(0, m.start() - 8):m.end() + 8].strip()   # 고쳐 쓸 때 어느 자리인지 알게 (11-22)
+        if v in bad_set:
+            issues.append(f"{where}의 숫자 '{m.group()}'('…{ctx}…')는 한 곳만 쓴 숫자입니다. 빼세요")
+        elif TIME_UNIT.match(after):
+            issues.append(f"{where}의 '{m.group()}{TIME_UNIT.match(after).group().strip()}'('…{ctx}…')는 재료에 없는 때입니다. "
+                          "재료에 없는 배경 설명이면 그 문장을 통째로 빼세요")
+        else:
+            issues.append(f"{where}의 숫자 '{m.group()}'('…{ctx}…')는 재료에 없습니다. 그 숫자가 든 말을 빼세요")
+    return issues
+
+
+def summary_issue(summary, ok_set, bad_set, fact_text, today):
+    """맨 앞 요약이 쓸 수 없는 이유 (있으면 요약만 비운다 — 고쳐 쓰지 않음)."""
+    if not summary:
+        return ""
+    bad = num_issues(summary, "요약", ok_set, bad_set, fact_text) + (check_dates(summary, today) if today else [])
+    for rx, msg in BANNED:
+        if rx.search(summary):
+            bad.append(msg)
+    if ADVICE.search(summary) or OPINION.search(summary):
+        bad.append("투자 권유 · 평가 말")
+    return bad[0] if bad else ""
+
+
 def check(post, ev, ok_set, bad_set, fact_text, today=None):
     """검사에 걸린 것 [문장]. 빈 목록이면 통과."""
     issues = []
     title, raw = (post.get("title") or "").strip(), (post.get("body") or "").strip()
     if not title or not raw:
         return ["제목이나 본문이 비었습니다"]
-    issues += check_bold(title, raw)
-    body = plain(raw)                                        # 나머지 검사는 ** 를 뗀 글로
+    body = plain(raw)                                        # 검사는 강조 표시를 뗀 글로 (표시는 tidy_marks가 코드로 다듬음)
     if today:
         issues += check_dates(title + " " + body, today)
     issues += check_repeat_dates(body) + check_commas(title + " " + body)
@@ -345,23 +417,7 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
     if title.endswith("."):
         issues.append("제목 끝 마침표를 빼세요")
     for text, where in ((title, "제목"), (body, "본문")):
-        text = DATE.sub(" ", text)                         # 2026.11.19 같은 날짜 표기는 숫자 검사에서 뺀다
-        text = NAME_NUM.sub(" ", text)                     # 지수 · 제품 이름 속 숫자도 뺀다
-        for m in NUM.finditer(text):
-            v = _num(m.group())
-            if v in ok_set:
-                continue
-            after = text[m.end():m.end() + 4]
-            if TIME_UNIT.match(after) and v in _digits(fact_text):
-                continue                                   # 재료에 있는 날짜 · 분기 · 횟수
-            ctx = text[max(0, m.start() - 8):m.end() + 8].strip()   # 고쳐 쓸 때 어느 자리인지 알게 (11-22: '1월 1일'을 세 번 다 못 뺐다)
-            if v in bad_set:
-                issues.append(f"{where}의 숫자 '{m.group()}'('…{ctx}…')는 한 곳만 쓴 숫자입니다. 빼세요")
-            elif TIME_UNIT.match(after):
-                issues.append(f"{where}의 '{m.group()}{TIME_UNIT.match(after).group().strip()}'('…{ctx}…')는 재료에 없는 때입니다. "
-                              "재료에 없는 배경 설명이면 그 문장을 통째로 빼세요")
-            else:
-                issues.append(f"{where}의 숫자 '{m.group()}'('…{ctx}…')는 재료에 없습니다. 그 숫자가 든 말을 빼세요")
+        issues += num_issues(text, where, ok_set, bad_set, fact_text)
     sentences = [x.strip() for x in re.split(r"(?<=[.?!])\s+", body) if x.strip()]
     bad_end = [x for x in sentences if not x.endswith("니다.")]
     if bad_end:
@@ -403,7 +459,7 @@ def _generate(prompt):
 
 
 def split_body(raw):
-    """본문을 [(문단 번호, 문장)]으로. 굵게 표시(**)는 그대로 둔다 (굵게는 문장을 넘지 않는다 · check_bold)."""
+    """본문을 [(문단 번호, 문장)]으로. 강조 표시는 그대로 둔다 (표시는 문장을 넘지 않는다 · tidy_marks)."""
     out = []
     paras = [x for x in re.split(r"\n\s*\n", raw or "") if x.strip()]
     for pi, para in enumerate(paras):
@@ -421,25 +477,31 @@ def drop_sentences(sents, drop):
 
 
 def fact_check(post, facts, agreed):
-    """⑦-2 사실 확인 (Flash Lite). → (문장 목록, 제목이 걸린 이유 또는 '', [(문장 번호, 이유)])."""
+    """⑦-2 사실 확인 (Flash Lite). → (문장 목록, 제목이 걸린 이유 또는 '', [(문장 번호, 이유)], 요약이 걸린 이유 또는 '')."""
     sents = split_body(post["body"])
     fact_lines = "\n".join(f"{i + 1}. {line[2:]}" for i, line in enumerate(facts.splitlines()))
-    lines = "\n".join([f"0. {post['title']}"] + [f"{i + 1}. {plain(x)}" for i, (_, x) in enumerate(sents)])
+    rows = [f"0. {post['title']}"] + [f"{i + 1}. {plain(x)}" for i, (_, x) in enumerate(sents)]
+    s_no = len(sents) + 1 if post.get("summary") else None
+    if s_no:
+        rows.append(f"{s_no}. (요약) {post['summary']}")
+    lines = "\n".join(rows)
     out = llm.generate_json(FACT_PROMPT.format(facts=fact_lines, agreed=agreed, sents=lines),
                             max_out=8192, models=CHECK_MODELS)
     items = out if isinstance(out, list) else out.get("items") if isinstance(out, dict) else None
     if not isinstance(items, list):
         raise llm.LLMError("사실 확인 답이 형식에 맞지 않음")
-    title_bad, bad = "", []
+    title_bad, bad, summary_bad = "", [], ""
     for it in items:
         if not isinstance(it, dict) or it.get("ok") is not False or not isinstance(it.get("n"), int):
             continue
         why = str(it.get("why") or "재료에 없음")[:120]
         if it["n"] == 0:
             title_bad = why
+        elif s_no and it["n"] == s_no:
+            summary_bad = why
         elif 1 <= it["n"] <= len(sents):
             bad.append((it["n"] - 1, why))
-    return sents, title_bad, bad
+    return sents, title_bad, bad, summary_bad
 
 
 def slugify(raw):
@@ -472,8 +534,7 @@ def write_one(ev, today):
     date = f"{today.year}년 {today.month}월 {today.day}일"
     base = dict(title=ev["title"], cat=CAT_KO.get(ev.get("cat"), "그 밖"), date=date, day=today.day,
                 facts=facts, agreed=agreed, single=single,
-                min_chars=MIN_CHARS, max_chars=MAX_CHARS, title_max=TITLE_MAX,
-                bold_min=BOLD_MIN, bold_max=BOLD_MAX, bold_para=BOLD_PARA, bold_len=BOLD_LEN)
+                min_chars=MIN_CHARS, max_chars=MAX_CHARS, title_max=TITLE_MAX)
     post, issues, tries, used = None, [], 0, []
     for tries in range(1, WRITE_TRIES + 1):
         fix = FIX_BLOCK.format(issues="\n".join(f"- {i}" for i in issues), title=post["title"], body=post["body"]) if post else ""
@@ -483,16 +544,23 @@ def write_one(ev, today):
         if not isinstance(out, dict):
             issues = ["JSON 형식이 아닙니다"]
             continue
-        post = {"title": str(out.get("title") or "").strip(), "body": str(out.get("body") or "").strip(),
-                "slug": slugify(str(out.get("slug") or ""))}
+        post = {"title": plain(str(out.get("title") or "")).strip(), "body": tidy_marks(str(out.get("body") or "").strip()),
+                "slug": slugify(str(out.get("slug") or "")), "summary": plain(str(out.get("summary") or "")).strip(),
+                "banner": tidy_banner(out.get("banner"))}
         issues = check(post, ev, ok_set, bad_set, fact_text, today)
         if not issues:
             break
-    fact = {"removed": [], "model": ""}
+    fact = {"removed": [], "model": "", "summaryDropped": ""}
+    if post and not issues and post.get("summary"):           # 요약은 고쳐 쓰지 않는다: 걸리면 비우고 블로그가 대체한다 (12절)
+        why = summary_issue(post["summary"], ok_set, bad_set, fact_text, today)
+        if why:
+            fact["summaryDropped"], post = why, dict(post, summary="")
     if post and not issues:                                   # ⑦-2 사실 확인: 다시 쓰지 않고 근거 없는 문장만 지운다
         try:
-            sents, title_bad, bad = fact_check(post, facts, agreed)
+            sents, title_bad, bad, summary_bad = fact_check(post, facts, agreed)
             fact["model"] = llm.stats.get("lastModel") or ""
+            if summary_bad and not title_bad:
+                fact["summaryDropped"], post = f"사실 확인: {summary_bad}", dict(post, summary="")
             if title_bad:
                 issues = [f"사실 확인: 제목에 재료에 없는 내용이 있습니다 ({title_bad})"]
             elif bad:
@@ -500,8 +568,7 @@ def write_one(ev, today):
                 post = dict(post, body=drop_sentences(sents, {i for i, _ in bad}))
                 n = len(plain(post["body"]).replace("\n", ""))
                 issues = [f"사실 확인 뒤: {x}" for x in check(post, ev, ok_set, bad_set, fact_text, today)
-                          if not (x.startswith("굵게 표시가 ") and "곳입니다" in x)       # 지운 탓에 굵게가 모자란 것,
-                          and not (x.startswith("본문이 ") and FACT_MIN_CHARS <= n <= MAX_CHARS)]   # 짧아진 것은 괜찮다
+                          if not (x.startswith("본문이 ") and FACT_MIN_CHARS <= n <= MAX_CHARS)]   # 짧아진 것은 괜찮다
         except llm.LLMError as e:
             issues = [f"사실 확인을 못 했습니다 ({e})"]       # 확인 못 한 글은 블로그에 넘기지 않는다
     return post, issues, tries, used, fact
@@ -533,7 +600,8 @@ def to_blog(blog_db, doc_id, post, ev, today, now):
     while list(col.where(filter=FieldFilter("slug", "==", slug)).limit(1).stream()):
         slug, k = f"{base}-{k}", k + 1
     col.document(doc_id).set({
-        "title": post["title"], "body": post["body"], "date": today.strftime("%Y-%m-%d"), "createdAt": now,
+        "title": post["title"], "summary": post.get("summary", ""), "banner": post.get("banner") or {"titles": [], "keys": []},
+        "body": post["body"], "date": today.strftime("%Y-%m-%d"), "createdAt": now,
         "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
         "stocks": top_stocks(ev), "sector": top_sector(ev), "slug": slug, "version": BLOG_VERSION,
     })
@@ -580,6 +648,8 @@ def main():
         db.collection("posts").document(doc_id).set({
             "status": status, "title": post["title"] if post else "", "body": post["body"] if post else "",
             "slug": post.get("slug", "") if post else "", "factRemoved": fact["removed"], "factModel": fact["model"],
+            "summary": post.get("summary", "") if post else "", "banner": post.get("banner", {}) if post else {},
+            "summaryDropped": fact["summaryDropped"], "version": BLOG_VERSION,
             "issues": issues, "tries": tries, "models": used,
             "eventTitle": ev["title"], "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
             "sourceCount": ev.get("sourceCount"), "outlets": ev.get("outlets", []),
