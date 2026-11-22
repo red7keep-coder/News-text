@@ -68,6 +68,7 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
   '~ 기준으로 ~했습니다'는 '19일 기준 ~였습니다'처럼 줄여 씁니다.
 - 사람: 한국 사람은 '기관 · 부서 이름 직함' 순서로 씁니다. 예: '산업통상부 무역투자 강감찬 실장은' (O) / '강감찬 산업통상부 무역투자실장은' (X).
   대통령 · 총리 · 이름난 기업 총수처럼 널리 알려진 사람이 아니면 이름을 굵게 하지 않습니다.
+- 재료에 없는 배경 지식(지난 연도 · 날짜 · 역사 · 다른 사건)을 덧붙이지 않습니다. 알고 있는 사실이라도 재료에 없으면 쓰지 않습니다.
 - 사실만 씁니다. 전망 · 평가 · 비유 · 기자 해석을 더하지 않습니다(좋다 · 우려 · 기대감 · 호재 · 악재 같은 말 금지).
 - 매수 · 매도 · 추천 같은 투자 권유를 쓰지 않습니다.
 - 재료의 문장을 그대로 옮기지 말고 새 문장으로 씁니다. 언론사 이름을 쓰지 않습니다.
@@ -98,6 +99,11 @@ BANNED = [(re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}"), "날짜를 '2026.11.19'처럼
           (re.compile(r"닿"), "'닿다'를 썼습니다"), (re.compile(r"이 (사건|소식|발표|기업)"), "'이 사건' 같은 지시어를 썼습니다")]
 NUM = re.compile(r"\d[\d,]*(?:\.\d+)?")
 DATE = re.compile(r"\d{4}\.\d{1,2}\.\d{1,2}")
+# 이름 속 숫자는 수치가 아니다 (11-22: '다우존스30산업평균지수' · 'S&P 500지수'의 30 · 500을 재료에 없는 숫자로 걸어 시황 글이 늘 실패)
+NAME_NUM = re.compile(
+    r"다우(?:존스)?\s?30|(?:S&P|스탠더드앤드푸어스|에스앤피)\s?500|나스닥\s?100|코스피\s?200|코스닥\s?150|KRX\s?300"
+    r"|러셀\s?2000|닛케이\s?225|니케이\s?225|유로스톡스\s?50|CSI\s?300|FTSE\s?100|DAX\s?40|CAC\s?40"
+    r"|[A-Za-z][A-Za-z&]*-?\d+[A-Za-z]*")     # G20 · H200 · GPT-5 · S25: 로마자에 붙은 모델 · 제품 이름
 TIME_UNIT = re.compile(r"^\s*(년|월|일|분기|시|분|차|번째|개월|주|회|호)")
 SHELL = re.compile(r"(공개|발표|공시|집계|제시|보고|소개)\s*(되었|됐|된다|되어)")
 DATE_WORD = re.compile(r"\d+\s*(년|월|일|분기)")
@@ -291,6 +297,7 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
         issues.append("제목 끝 마침표를 빼세요")
     for text, where in ((title, "제목"), (body, "본문")):
         text = DATE.sub(" ", text)                         # 2026.11.19 같은 날짜 표기는 숫자 검사에서 뺀다
+        text = NAME_NUM.sub(" ", text)                     # 지수 · 제품 이름 속 숫자도 뺀다
         for m in NUM.finditer(text):
             v = m.group().replace(",", "")
             if v in ok_set:
@@ -298,10 +305,14 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
             after = text[m.end():m.end() + 4]
             if TIME_UNIT.match(after) and v in _digits(fact_text):
                 continue                                   # 재료에 있는 날짜 · 분기 · 횟수
+            ctx = text[max(0, m.start() - 8):m.end() + 8].strip()   # 고쳐 쓸 때 어느 자리인지 알게 (11-22: '1월 1일'을 세 번 다 못 뺐다)
             if v in bad_set:
-                issues.append(f"{where}의 숫자 '{m.group()}'는 한 곳만 쓴 숫자입니다. 빼세요")
+                issues.append(f"{where}의 숫자 '{m.group()}'('…{ctx}…')는 한 곳만 쓴 숫자입니다. 빼세요")
+            elif TIME_UNIT.match(after):
+                issues.append(f"{where}의 '{m.group()}{TIME_UNIT.match(after).group().strip()}'('…{ctx}…')는 재료에 없는 때입니다. "
+                              "재료에 없는 배경 설명이면 그 문장을 통째로 빼세요")
             else:
-                issues.append(f"{where}의 숫자 '{m.group()}'는 재료에 없습니다. 빼세요")
+                issues.append(f"{where}의 숫자 '{m.group()}'('…{ctx}…')는 재료에 없습니다. 그 숫자가 든 말을 빼세요")
     sentences = [x.strip() for x in re.split(r"(?<=[.?!])\s+", body) if x.strip()]
     bad_end = [x for x in sentences if not x.endswith("니다.")]
     if bad_end:
