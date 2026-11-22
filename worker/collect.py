@@ -6,7 +6,10 @@
   ④ 사실    기사 몇 건씩 묶어 사실(누가 · 언제 · 무엇을 · 숫자 · 짧은 발언)을 뽑는다 (Gemini lite)
   ⑤ 사건    지난 36시간의 사실을 사건으로 묶고, 몇 곳이 썼는지 · 숫자가 두 곳 이상에서 맞는지 센다 (Gemini lite)
 
-저장(Firestore, 비공개): articles · eventsets · runs · outlet_state, outlets.feed
+저장(Firestore, 비공개): articles · eventsets · runs · outlet_state · eventnames, outlets.feed
+블로그 저장소(BLOG_PROJECT, 블로그가 읽기만): headlines — 고르기를 통과한 제목 묶음(본문 없음, 문서당 1,500건). 30일 지나면 지운다
+가벼운 회차(LIGHT=1, 평일 14:40 예약): ① 목록 · ② 고르기만 하고 headlines만 쓴다. '이미 본 것'으로 남기지 않는다
+  (그래야 16:30 회차가 같은 기사를 다시 골라 본문을 받는다 — 요청-알파스코프-뉴스-글-발행 11절 Q12)
 공개 로그: 건수 · 글자 수 · 호출 수만. 언론사 이름 · 주소 · 제목 · 본문 · AI 입출력은 찍지 않는다.
 """
 import hashlib
@@ -25,6 +28,10 @@ FRESH_HOURS = 36           # 이보다 오래된 목록 항목은 보지 않는�
 EVENT_HOURS = 36           # 사건 묶기에 넣을 사실의 기간
 SEEN_CAP = 5000            # 언론사마다 기억할 '이미 본 기사' 수
 TITLE_CHUNK = 1500         # 고르기 한 번에 넣을 제목 수
+HEADLINES_PER_DOC = 1500   # headlines 문서 하나에 담을 제목 수 (Firestore 문서 1MB 한도, 블로그 읽기 수를 줄이려고 몰아 담음)
+HEADLINES_DAYS = 30        # 이보다 오래된 headlines 문서는 지운다
+CARRY_HOURS = 24           # 이 기간 실행들의 사건 이름을 이어 쓴다 (11절 Q13)
+LIGHT = os.environ.get("LIGHT") == "1"
 PER_EVENT = 3              # 한 사건에서 본문을 받을 최대 언론사 수
 FACT_BATCH_N = 5           # 사실 뽑기 한 번에 넣을 기사 수
 FACT_BATCH_CHARS = 40_000  # 사실 뽑기 한 번에 넣을 본문 글자 수 (기사를 자르지 않고 묶음을 나눈다)
@@ -77,6 +84,7 @@ MERGE_PROMPT = """아래는 여러 언론사 기사 제목에 붙인 사건 이�
 같은 사건(같은 회사의 같은 발표 · 같은 정책 · 같은 지표 발표 · 같은 날 같은 시장 마감)을 가리키는 번호끼리 묶으세요.
 주제가 비슷해도 다른 회사 · 다른 발표 · 다른 날이면 묶지 마세요. 애매하면 묶지 마세요.
 두 개 이상 묶이는 것만 답하세요.
+줄 끝에 (앞 실행)이 붙은 이름은 앞선 실행에서 이미 쓴 사건 이름입니다. 같은 사건이면 그 줄과 함께 묶으세요.
 
 JSON만 답하세요: {{"groups":[[번호,번호]]}}
 
@@ -225,20 +233,28 @@ def pick(cands, stats):
     return kept
 
 
-def merge_events(kept, stats):
+def merge_events(kept, stats, prev=None):
     """고르기는 제목을 TITLE_CHUNK개씩 나눠 이름을 붙이므로 같은 사건에 다른 이름이 붙는다 (11-19: 두 곳 이상 사건 0개).
-    이름 목록을 한 번 더 보여 주고 같은 사건 이름을 하나로 합친다. 실패해도 고르기는 그대로 간다."""
+    이름 목록을 한 번 더 보여 주고 같은 사건 이름을 하나로 합친다. 실패해도 고르기는 그대로 간다.
+    prev: 지난 실행들의 [(사건 이름, 예시 제목)]. 같은 사건이면 앞 실행 이름을 그대로 쓴다 (블로그가 실행 사이를 잇게, 11-22)."""
     names = {}
     for c in kept:
         names.setdefault(norm_label(c["event"]), (c["event"], c["title"]))
-    keys = list(names)
-    stats["eventNames"] = len(keys)
+    stats["eventNames"] = len(names)
+    old = set()
+    for name, title in prev or []:
+        k = norm_label(name)
+        if k and k not in names:
+            names[k] = (name, title)
+            old.add(k)
+    keys = [k for k in names if k not in old] + [k for k in names if k in old]   # 이번 이름 먼저 (나눠 넣어도 함께 보이게)
     if len(keys) < 2:
         return kept
     remap = {}
     for s in range(0, len(keys), TITLE_CHUNK):
         part = keys[s:s + TITLE_CHUNK]
-        lines = "\n".join(f"{k}|{names[key][0]}|{names[key][1][:60]}" for k, key in enumerate(part))
+        lines = "\n".join(f"{k}|{names[key][0]}|{names[key][1][:60]}" + (" (앞 실행)" if key in old else "")
+                          for k, key in enumerate(part))
         try:
             out = llm.generate_json(MERGE_PROMPT.format(lines=lines), max_out=16384)
         except llm.LLMError:
@@ -251,9 +267,11 @@ def merge_events(kept, stats):
                 continue
             if len(idx) < 2:
                 continue
-            head = remap.get(part[idx[0]], part[idx[0]])
-            for i in idx[1:]:
-                remap[part[i]] = head
+            first = next((i for i in idx if part[i] in old), idx[0])    # 앞 실행 이름이 있으면 그 이름으로
+            head = remap.get(part[first], part[first])
+            for i in idx:
+                if i != first and part[i] not in old:
+                    remap[part[i]] = head
     out_kept = []
     for c in kept:
         k, hops = norm_label(c["event"]), 0
@@ -263,7 +281,44 @@ def merge_events(kept, stats):
             c = dict(c, event=names[k][0])
         out_kept.append(c)
     stats["eventNamesMerged"] = len({norm_label(c["event"]) for c in out_kept})
+    stats["eventNamesCarried"] = len({norm_label(c["event"]) for c in out_kept} & old)
     return out_kept
+
+
+# ---------- 블로그 제목 묶음 ----------
+
+def _kst_iso(dt):
+    return dt.astimezone(KST).isoformat(timespec="seconds") if dt else None
+
+
+def headline_items(kept, names, now, stocks=None):
+    """고르기를 통과한 제목 → headlines 항목. 본문 · 사실은 넣지 않는다 (요청-알파스코프-뉴스-글-발행 10 · 11절)."""
+    stocks = stocks or {}
+    return [{"title": html.unescape(c["title"]), "outlet": names.get(c["no"], ""), "url": c["url"],
+             "publishedAt": _kst_iso(datetime.fromtimestamp(c["ts"], timezone.utc)) if c.get("ts") else None,
+             "foundAt": _kst_iso(now), "event": c["event"], "cat": c.get("cat") or "", "stocks": stocks.get(c["id"], [])}
+            for c in kept]
+
+
+def write_headlines(blog_db, run_id, items, now, light):
+    """headlines/{실행 번호}-{n}: 문서당 HEADLINES_PER_DOC건. 같은 실행이 다시 쓰면 덮어쓴다."""
+    parts = [items[i:i + HEADLINES_PER_DOC] for i in range(0, len(items), HEADLINES_PER_DOC)] or [[]]
+    batch = blog_db.batch()
+    for n, chunk in enumerate(parts, 1):
+        batch.set(blog_db.collection("headlines").document(f"{run_id}-{n}"), {
+            "run": str(run_id), "part": n, "parts": len(parts), "createdAt": now, "version": 1,
+            "light": light, "count": len(chunk), "items": chunk})
+    batch.commit()
+    return len(parts)
+
+
+def prune_headlines(blog_db, now):
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    old = list(blog_db.collection("headlines")
+               .where(filter=FieldFilter("createdAt", "<", now - timedelta(days=HEADLINES_DAYS))).stream())
+    for d in old:
+        d.reference.delete()
+    return len(old)
 
 
 def choose(kept, limit, same=None):
@@ -519,9 +574,11 @@ def main():
     from google.cloud.firestore_v1.base_query import FieldFilter
 
     db = firestore.Client(project=os.environ["GCP_PROJECT"])
+    blog_db = (firestore.Client(project=os.environ["BLOG_PROJECT"], database=os.environ.get("BLOG_DATABASE") or "(default)")
+               if os.environ.get("BLOG_PROJECT") else None)
     now = datetime.now(timezone.utc)
     run_id = os.environ.get("GITHUB_RUN_ID") or now.strftime("local-%Y%m%d%H%M%S")
-    stats = {"listed": {}, "blockedList": [], "noFeed": [], "errorList": {}, "listNotes": {}, "stage": "목록"}
+    stats = {"listed": {}, "blockedList": [], "noFeed": [], "errorList": {}, "listNotes": {}, "stage": "목록", "light": LIGHT}
     run_ref = db.collection("runs").document(str(run_id))
     try:
         outlets = sorted((d.to_dict() for d in db.collection("outlets").stream() if d.to_dict().get("enabled", True)),
@@ -547,13 +604,32 @@ def main():
             stats["stage"] = "새 기사 없음"
             return
 
-        # ② 고르기
+        # ② 고르기 (지난 CARRY_HOURS 실행들의 사건 이름을 이어 쓴다)
         stats["stage"] = "고르기"
-        kept = merge_events(pick(cands, stats), stats)
-        chosen, multi = choose(kept, MAX_FETCH, same)
+        prev = []
+        for d in db.collection("eventnames").where(
+                filter=FieldFilter("createdAt", ">=", now - timedelta(hours=CARRY_HOURS))).stream():
+            prev += [tuple(x) for x in d.to_dict().get("names", []) if isinstance(x, list) and len(x) == 2]
+        kept = merge_events(pick(cands, stats), stats, prev)
+        pairs = {}
+        for c in kept:
+            pairs.setdefault(norm_label(c["event"]), [c["event"], c["title"][:60]])
+        db.collection("eventnames").document(str(run_id)).set({"createdAt": now, "light": LIGHT, "names": list(pairs.values())})
+        chosen, multi = ([], 0) if LIGHT else choose(kept, MAX_FETCH, same)
         stats["chosen"], stats["multiGroups"] = len(chosen), multi
-        log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개, "
-            f"두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
+        log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개 "
+            f"(앞 실행 이름 이어 씀 {stats.get('eventNamesCarried', 0)}개), 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
+        out_names = {o["no"]: o.get("name", "") for o in outlets}
+        if blog_db is not None:
+            try:
+                n = write_headlines(blog_db, run_id, headline_items(kept, out_names, now), now, LIGHT)
+                stats["headlines"] = len(kept)
+                log(f"   블로그 제목 묶음: {len(kept):,}건 → 문서 {n}개, 오래된 문서 {prune_headlines(blog_db, now)}개 지움")
+            except Exception as e:                        # 블로그 저장소가 안 돼도 수집은 이어 간다
+                log(f"   블로그 제목 묶음을 못 씀 ({type(e).__name__})")
+        if LIGHT:                                         # 가벼운 회차: '이미 본 것'으로 남기지 않고 끝낸다
+            stats["stage"] = "끝(가벼운 회차)"
+            return
         # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게)
         batch = db.batch()
         for no, ids in new_ids.items():
@@ -571,6 +647,19 @@ def main():
         stats["stage"] = "사실"
         extract_facts(chosen, texts, stats)
         log(f"④ 사실: 사실 {stats['facts']}개 (기사 문장과 겹친 줄 {stats['copiedFacts']}개, 실패한 묶음 {stats['factBatchesFailed']}개)")
+        if blog_db is not None and stats.get("headlines") is not None:   # 본문을 받은 기사에는 종목을 붙여 다시 쓴다
+            stocks = {}
+            for c in chosen:
+                seen_st = {}
+                for f in c.get("facts", []):
+                    for st in f.get("stocks", []):
+                        seen_st.setdefault(st["name"], st)
+                if seen_st:
+                    stocks[c["id"]] = list(seen_st.values())[:5]
+            try:
+                write_headlines(blog_db, run_id, headline_items(kept, out_names, now, stocks), now, LIGHT)
+            except Exception as e:
+                log(f"   블로그 제목 묶음에 종목을 못 붙임 ({type(e).__name__})")
         batch = db.batch()
         for c in chosen:
             doc = {"no": c["no"], "url": c["url"], "title": c["title"],

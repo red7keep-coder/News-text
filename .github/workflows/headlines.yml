@@ -1,0 +1,49 @@
+name: headlines
+
+# 가벼운 회차 (worker/collect.py, LIGHT=1): ① 목록 · ② 고르기만 하고, 고른 제목 묶음을 블로그 저장소 headlines에 쓴다.
+# 본문 받기 · 사실 · 글쓰기는 하지 않고, '이미 본 것'으로 남기지 않는다 (16:30 회차가 같은 기사의 본문을 받게).
+# 블로그 16:10 실행에 맞추려고 평일 14:40 KST 예약. GitHub 예약은 50 ~ 60분 늦게 시작해 보통 15:30 ~ 15:40에 끝난다.
+on:
+  schedule:
+    - cron: "40 5 * * 1-5"   # 평일 14:40 KST
+  workflow_dispatch:
+
+concurrency:
+  group: outlets      # collect · probe와 같은 줄: 언론사에 두 실행이 겹쳐 요청하지 않게
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  headlines:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: worker/requirements.txt
+
+      - run: pip install -r worker/requirements.txt
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER }}
+          service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
+
+      - name: 목록 · 고르기 · 제목 묶음
+        working-directory: worker
+        run: python collect.py
+        env:
+          PYTHONUNBUFFERED: "1"
+          LIGHT: "1"
+          GCP_PROJECT: ${{ vars.GCP_PROJECT }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_MODELS: ${{ vars.GEMINI_MODELS }}
+          BLOG_PROJECT: ${{ vars.BLOG_PROJECT }}
+          BLOG_DATABASE: ${{ vars.BLOG_DATABASE }}
