@@ -4,18 +4,21 @@
   ② 고르기  제목만 보고 시장 · 업종 · 기업 · 경제 정책 기사를 고르고 같은 사건끼리 이름을 맞춘다 (Gemini lite)
   ③ 받기    고른 기사 본문을 받는다 (실행당 MAX_FETCH건, 여러 곳이 다룬 사건 먼저). 본문은 메모리에서만
   ④ 사실    기사 몇 건씩 묶어 사실(누가 · 언제 · 무엇을 · 숫자 · 짧은 발언)을 뽑는다 (Gemini lite)
-  ⑤ 사건    지난 36시간의 사실을 사건으로 묶고, 몇 곳이 썼는지 · 숫자가 두 곳 이상에서 맞는지 센다 (Gemini lite)
+  ⑤ 사건    지난 36시간의 사실을 사건으로 묶고(같은 사실끼리도 묶음), 몇 곳이 썼는지 · 숫자가 두 곳 이상에서 맞는지 센다 (Gemini lite)
 
 저장(Firestore, 비공개): articles · eventsets · runs · outlet_state · eventnames, outlets.feed
 블로그 저장소(BLOG_PROJECT, 블로그가 읽기만): headlines — 고르기를 통과한 제목 묶음(본문 없음, 문서당 1,500건). 30일 지나면 지운다
+  facts — 정기 회차 ⑤의 사건별 사실(언론사 · 주소 · 제목 없음, 문서당 900KB, 15절). 30일 지나면 지운다
 가벼운 회차(LIGHT=1, 평일 14:40 예약): ① 목록 · ② 고르기만 하고 headlines만 쓴다. '이미 본 것'으로 남기지 않는다
   (그래야 16:30 회차가 같은 기사를 다시 골라 본문을 받는다 — 요청-알파스코프-뉴스-글-발행 11절 Q12)
 공개 로그: 건수 · 글자 수 · 호출 수만. 언론사 이름 · 주소 · 제목 · 본문 · AI 입출력은 찍지 않는다.
 """
 import hashlib
 import html
+import json
 import os
 import re
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
@@ -30,6 +33,7 @@ SEEN_CAP = 5000            # 언론사마다 기억할 '이미 본 기사' 수
 TITLE_CHUNK = 1500         # 고르기 한 번에 넣을 제목 수
 HEADLINES_PER_DOC = 1500   # headlines 문서 하나에 담을 제목 수 (Firestore 문서 1MB 한도, 블로그 읽기 수를 줄이려고 몰아 담음)
 HEADLINES_DAYS = 30        # 이보다 오래된 headlines 문서는 지운다
+FACTS_DOC_BYTES = 900_000  # facts 문서 하나 크기 (Firestore 1MB 한도에 여유를 둠)
 CARRY_HOURS = 24           # 이 기간 실행들의 사건 이름을 이어 쓴다 (11절 Q13)
 LIGHT = os.environ.get("LIGHT") == "1"
 PER_EVENT = 3              # 한 사건에서 본문을 받을 최대 언론사 수
@@ -94,7 +98,7 @@ JSON만 답하세요: {{"groups":[[번호,번호]]}}
 
 FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내부 재료이며, 기사 문장을 옮기면 안 됩니다.
 
-뽑는 것: 누가 · 언제 · 무엇을 했나, 숫자(발표치 · 예상치 · 금액 · 비율 · 날짜), 누가 말했는지 분명한 짧은 발언(한 문장 이하),
+뽑는 것: 누가 · 언제 · 무엇을 했나, 숫자(발표치 · 예상치 · 금액 · 비율 · 날짜), 누가 말했는지 분명한 직접 인용 발언(한두 문장),
 그 사실의 원문 출처(공시 · 보도자료 · 정부 발표 · 통계)가 무엇인지.
 뽑지 않는 것: 기자의 해석 · 전망 · 평가 · 비유, 증권사 연구원 · 전문가의 견해(짧은 발언 하나만 quote로 가능),
 사진 · 그래프 · 표 설명, 기사에 없는 내용.
@@ -104,6 +108,8 @@ FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내�
 - "검토 중 · 추진 · 논의" 같은 아직 정해지지 않은 사실도 넣고 stage를 discussing으로 적으세요.
 - direction은 그 사실이 관련 종목 · 업종 · 자산 가격에 주는 방향(기사에 드러난 대로) up / down / neutral. 모르면 neutral.
 - 매수 · 매도를 권하는 말을 만들지 마세요.
+- quote.text는 기사에서 따옴표로 직접 인용한 말만, 따옴표 안 글자 그대로 옮기세요(이것만은 기사 글자 그대로). 다듬거나 간접 인용을 직접 인용으로 바꾸지 마세요.
+  speaker는 기사에 적힌 이름(이름이 없으면 "업계 관계자"처럼 기사 표현 그대로), title은 직함, venue는 말한 자리(기자간담회 · 국회 · 실적 발표 · 인터뷰 등, 모르면 빈 값).
 - 숫자는 기사에 적힌 값 그대로(단위 포함). 계산하거나 반올림하지 마세요.
 - when은 기사에 적힌 만큼만 씁니다. 연월만 있으면 YYYY-MM, 연도만 있으면 YYYY. 없는 월 · 일을 01로 채우지 마세요.
 - 숫자가 알맹이인 사실은 what에 숫자를 넣으세요. "자산총계 · 실적이 공개되었다"처럼 무엇이 나왔다는 말만 있는 문장은 쓰지 마세요.
@@ -113,7 +119,7 @@ FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내�
 JSON만 답하세요:
 {{"articles":[{{"id":"기사 id","facts":[{{"what":"","who":"","when":"YYYY-MM-DD · YYYY-MM · YYYY 또는 빈 값",
 "numbers":[{{"name":"","value":"","unit":"","kind":"발표|예상|기타"}}],
-"quote":{{"speaker":"","text":""}} 또는 null,
+"quote":{{"speaker":"","title":"","venue":"","text":""}} 또는 null,
 "stocks":[{{"name":"","code":"6자리 종목코드 또는 빈 값"}}],
 "sector":"","cat":"코드","direction":"up|down|neutral","stage":"confirmed|discussing",
 "origin":"공시|보도자료|정부 발표|통계|없음"}}]}}]}}
@@ -126,9 +132,11 @@ EVENTS_PROMPT = """아래는 여러 언론사 기사에서 뽑은 사실 목록�
 같은 사건을 다룬 사실끼리 묶으세요. 같은 회사의 같은 발표 · 같은 정책 · 같은 지표 발표면 같은 사건입니다.
 주제가 비슷해도 다른 회사 · 다른 발표면 다른 사건입니다.
 모든 사실id는 정확히 한 사건에 들어가야 합니다 (사실 하나뿐인 사건도 됩니다).
+한 사건 안에서는 같은 사실(다른 기사가 같은 내용 · 같은 숫자를 전한 것)끼리 한 묶음으로 넣으세요.
+facts는 묶음의 목록입니다. 예: [["사실id","사실id"],["사실id"]]. 내용이 조금이라도 다르면 다른 묶음입니다.
 사건마다 title을 새로 쓴 한 문장(40자 안팎)으로, cat을 아래 분류 코드 중 하나로 붙이세요. 분류: {cats}
 
-JSON만 답하세요: {{"events":[{{"title":"","cat":"코드","facts":["사실id"]}}]}}
+JSON만 답하세요: {{"events":[{{"title":"","cat":"코드","facts":[["사실id"]]}}]}}
 
 사실 목록:
 {lines}
@@ -312,13 +320,73 @@ def write_headlines(blog_db, run_id, items, now, light):
     return len(parts)
 
 
-def prune_headlines(blog_db, now):
+def prune_headlines(blog_db, now, coll="headlines"):
     from google.cloud.firestore_v1.base_query import FieldFilter
-    old = list(blog_db.collection("headlines")
+    old = list(blog_db.collection(coll)
                .where(filter=FieldFilter("createdAt", "<", now - timedelta(days=HEADLINES_DAYS))).stream())
     for d in old:
         d.reference.delete()
     return len(old)
+
+
+# ---------- 블로그 사건별 사실 (15절 R17 ~ R22) ----------
+# 언론사가 드러나는 칸(sources · outlets · 사실의 no · article, 숫자의 outlets)은 넘기지 않는다 (9절).
+
+def _blog_quote(q):
+    if not q:
+        return None
+    verified = bool(q.get("verified"))                  # 확인 전 저장된 발언은 확인 안 된 것으로
+    return {"speaker": q.get("speaker", ""), "title": q.get("title", ""), "venue": q.get("venue", ""),
+            "text": q.get("text", "") if verified else "", "verified": verified,
+            "anonymous": bool(q.get("anonymous", ANON.search(q.get("speaker", ""))))}
+
+
+def blog_event(ev):
+    rows = {}
+    for f in ev["facts"]:
+        rows.setdefault(f.get("group", id(f)), []).append(f)
+    facts = []
+    for g in rows.values():                             # 같은 사실 묶음에서 한 줄: 확인된 발언 · 숫자가 많은 것
+        f = max(g, key=lambda f: (bool(f.get("quote") and f["quote"].get("verified")), len(f["numbers"])))
+        facts.append({"what": f["what"], "who": f["who"], "when": f["when"],
+                      "numbers": [{k: n[k] for k in ("name", "value", "unit", "kind")} for n in f["numbers"]],
+                      "quote": _blog_quote(f.get("quote")), "stocks": f["stocks"], "sector": f["sector"],
+                      "cat": f["cat"], "direction": f["direction"], "stage": f["stage"], "origin": f["origin"],
+                      "sources": f.get("sources", 1)})
+    stocks, info = Counter(), {}
+    for f in ev["facts"]:
+        for st in f.get("stocks") or []:
+            stocks[st["name"]] += 1
+            d = info.setdefault(st["name"], {"name": st["name"], "code": ""})
+            d["code"] = d["code"] or st.get("code", "")
+    sectors = Counter(f["sector"].strip() for f in ev["facts"] if f.get("sector", "").strip())
+    return {"event": ev.get("event") or ev["title"], "cat": ev["cat"], "direction": ev["direction"], "stage": ev["stage"],
+            "sourceCount": ev["sourceCount"], "outletCount": ev["outletCount"], "single": ev["single"],
+            "stocks": [info[n] for n, _ in stocks.most_common(10)],
+            "sector": sectors.most_common(1)[0][0] if sectors else "",
+            "numbers": [{k: n[k] for k in ("name", "value", "unit", "kind", "sources", "agreed")} for n in ev["numbers"]],
+            "facts": facts}
+
+
+def write_facts(blog_db, run_id, events, copied_dropped, now):
+    """facts/{실행 번호}-{n}: 사건 전부, 문서 크기 FACTS_DOC_BYTES마다 나눈다 (버리지 않음)."""
+    rows = [blog_event(e) for e in events if e["facts"]]
+    parts, cur, size = [], [], 0
+    for r in rows:
+        n = len(json.dumps(r, ensure_ascii=False).encode()) + 100
+        if cur and size + n > FACTS_DOC_BYTES:
+            parts.append(cur)
+            cur, size = [], 0
+        cur.append(r)
+        size += n
+    parts = parts + [cur] if cur or not parts else parts
+    batch = blog_db.batch()
+    for n, chunk in enumerate(parts, 1):
+        batch.set(blog_db.collection("facts").document(f"{run_id}-{n}"), {
+            "run": str(run_id), "part": n, "parts": len(parts), "createdAt": now, "version": 1,
+            "count": len(chunk), "copiedDropped": copied_dropped, "events": chunk})
+    batch.commit()
+    return len(rows), len(parts)
 
 
 def choose(kept, limit, same=None):
@@ -394,8 +462,11 @@ def _clean_fact(f):
     if not isinstance(f, dict) or not str(f.get("what") or "").strip():
         return None
     q = f.get("quote") if isinstance(f.get("quote"), dict) else None
-    if q and (not q.get("text") or not q.get("speaker") or len(q["text"]) > 120):
+    if q and (not q.get("text") or not q.get("speaker") or len(str(q["text"])) > 200):
         q = None
+    if q:
+        q = {"speaker": str(q["speaker"]).strip()[:60], "title": str(q.get("title") or "").strip()[:60],
+             "venue": str(q.get("venue") or "").strip()[:40], "text": str(q["text"]).strip()}
     nums = []
     for n in f.get("numbers") or []:
         if isinstance(n, dict) and str(n.get("value") or "").strip():
@@ -421,6 +492,22 @@ def copied(what, text, n=25):
     return any(a[i:i + n] in b for i in range(0, max(0, len(a) - n + 1), 3))
 
 
+_QUOTE_MARKS = re.compile(r"[\s\"'“”‘’「」『』〈〉《》·.,…]")
+ANON = re.compile(r"관계자|업계|당국자|소식통|측근|핵심 ?인사|고위 ?인사|정통한|익명|한 인사|일각")
+
+
+def quote_in(text, body):
+    """발언이 본문에 글자 그대로 있나 (띄어쓰기 · 따옴표 · 문장부호 무시). copied 확인을 반대로 쓴 것."""
+    a, b = _QUOTE_MARKS.sub("", text), _QUOTE_MARKS.sub("", body)
+    return bool(a) and a in b
+
+
+def check_quote(q, body):
+    """R19 · R20: verified(본문에 그대로 있나, 없으면 text를 비움) · anonymous(이름 없는 말한 사람)."""
+    ok = quote_in(q["text"], body)
+    return dict(q, text=q["text"] if ok else "", verified=ok, anonymous=bool(ANON.search(q["speaker"])))
+
+
 def batches(items, texts):
     cur, size = [], 0
     for c in items:
@@ -436,7 +523,7 @@ def batches(items, texts):
 
 def extract_facts(chosen, texts, stats):
     have = [c for c in chosen if c["id"] in texts]
-    stats.update(facts=0, copiedFacts=0, factBatchesFailed=0)
+    stats.update(facts=0, copiedFacts=0, factBatchesFailed=0, quotes=0, quotesUnverified=0)
     for batch in batches(have, texts):
         parts = []
         for c in batch:
@@ -457,6 +544,10 @@ def extract_facts(chosen, texts, stats):
                 f = _clean_fact(f)
                 if not f:
                     continue
+                if f["quote"]:
+                    f["quote"] = check_quote(f["quote"], texts[c["id"]])
+                    stats["quotes"] += 1
+                    stats["quotesUnverified"] += not f["quote"]["verified"]
                 if copied(f["what"], texts[c["id"]]):
                     f["copied"] = True          # 기사 문장과 겹침. 글에 쓰지 않는다 (받는 쪽이 거름)
                     stats["copiedFacts"] += 1
@@ -522,15 +613,21 @@ def build_events(arts, stats, same=None):
     out = llm.generate_json(EVENTS_PROMPT.format(cats=CAT_TEXT, lines="\n".join(lines)), max_out=32768)
     groups, used = [], set()
     for e in (out or {}).get("events", []) if isinstance(out, dict) else []:
-        ids = [x for x in (e.get("facts") or []) if x in fidx and x not in used]
-        if ids:
-            used.update(ids)
-            groups.append((str(e.get("title") or "")[:120], e.get("cat") if e.get("cat") in CATEGORIES else "OTHER", ids))
+        same_facts = []                                      # 같은 사실 묶음 (예전 꼴 ["id", ...]도 받는다)
+        for g in e.get("facts") or []:
+            g = [x for x in (g if isinstance(g, list) else [g]) if isinstance(x, str) and x in fidx and x not in used]
+            if g:
+                used.update(g)
+                same_facts.append(g)
+        if same_facts:
+            groups.append((str(e.get("title") or "")[:120], e.get("cat") if e.get("cat") in CATEGORIES else "OTHER",
+                           same_facts))
     for fid in fidx:                                         # 모델이 빠뜨린 사실은 혼자 한 사건
         if fid not in used:
-            groups.append((fidx[fid][1]["what"][:120], fidx[fid][1]["cat"], [fid]))
+            groups.append((fidx[fid][1]["what"][:120], fidx[fid][1]["cat"], [[fid]]))
     events = []
-    for title, cat, ids in groups:
+    for title, cat, same_facts in groups:
+        ids = [x for g in same_facts for x in g]
         outlets = sorted({fidx[x][0]["no"] for x in ids})
         art_list = list({fidx[x][0]["id"]: fidx[x][0] for x in ids}.values())
         src = dict(zip((a["id"] for a in art_list), source_ids([(a["no"], a.get("title", "")) for a in art_list], same)))
@@ -551,10 +648,17 @@ def build_events(arts, stats, same=None):
         for x in ids:
             a = fidx[x][0]
             sources[a["id"]] = {"no": a["no"], "url": a["url"], "title": a["title"], "publishedAt": a.get("publishedAt")}
+        names = Counter(a.get("event") for a in art_list if a.get("event"))
+        fact_rows = []
+        for k, g in enumerate(same_facts):               # 같은 사실 묶음마다 실은 곳(독립 출처) 수
+            n_src = len({src[fidx[x][0]["id"]] for x in g})
+            fact_rows += [dict(fidx[x][1], no=fidx[x][0]["no"], article=fidx[x][0]["id"], group=k, sources=n_src)
+                          for x in g]
         events.append({
-            "title": title, "cat": cat, "outlets": outlets, "outletCount": len(outlets),
+            "title": title, "event": names.most_common(1)[0][0] if names else title,   # event: headlines와 같은 이름
+            "cat": cat, "outlets": outlets, "outletCount": len(outlets),
             "sourceCount": source_count, "single": source_count < 2,
-            "facts": [dict(fidx[x][1], no=fidx[x][0]["no"], article=fidx[x][0]["id"]) for x in ids],
+            "facts": fact_rows,
             "numbers": numbers, "agreedNumbers": sum(1 for n in numbers if n["agreed"]),
             "direction": ("up" if dirs.count("up") > dirs.count("down") else
                           "down" if dirs.count("down") > dirs.count("up") else "neutral"),
@@ -563,6 +667,7 @@ def build_events(arts, stats, same=None):
         })
     events.sort(key=lambda e: (-e["sourceCount"], -e["outletCount"], -len(e["facts"])))
     stats["events"] = len(events)
+    stats["copiedDropped"] = sum(1 for a in arts for f in a.get("facts") or [] if f.get("copied"))
     stats["multiEvents"] = sum(1 for e in events if not e["single"])
     return events
 
@@ -646,7 +751,8 @@ def main():
         # ④ 사실
         stats["stage"] = "사실"
         extract_facts(chosen, texts, stats)
-        log(f"④ 사실: 사실 {stats['facts']}개 (기사 문장과 겹친 줄 {stats['copiedFacts']}개, 실패한 묶음 {stats['factBatchesFailed']}개)")
+        log(f"④ 사실: 사실 {stats['facts']}개 (기사 문장과 겹친 줄 {stats['copiedFacts']}개, 실패한 묶음 {stats['factBatchesFailed']}개, "
+            f"발언 {stats['quotes']}개 중 본문에 없음 {stats['quotesUnverified']}개)")
         if blog_db is not None and stats.get("headlines") is not None:   # 본문을 받은 기사에는 종목을 붙여 다시 쓴다
             stocks = {}
             for c in chosen:
@@ -683,6 +789,13 @@ def main():
             "edition": now.astimezone(KST).strftime("%Y-%m-%d %H시"),
         })
         log(f"⑤ 사건: 기사 {len(arts)}건에서 사건 {stats.get('events', 0)}개, 두 곳 이상 {stats.get('multiEvents', 0)}개")
+        if blog_db is not None:
+            try:
+                n, parts = write_facts(blog_db, run_id, events, stats.get("copiedDropped", 0), now)
+                stats["blogFacts"] = n
+                log(f"   블로그 사건별 사실: 사건 {n}개 → 문서 {parts}개, 오래된 문서 {prune_headlines(blog_db, now, 'facts')}개 지움")
+            except Exception as e:                        # 블로그 저장소가 안 돼도 수집은 이어 간다
+                log(f"   블로그 사건별 사실을 못 씀 ({type(e).__name__})")
         stats["stage"] = "끝"
     except llm.LLMError as e:
         stats["llmError"] = str(e)
