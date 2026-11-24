@@ -84,10 +84,14 @@ JSON만 답하세요: {{"keep":[{{"i":번호,"event":"사건 이름","cat":"코�
 """
 
 MERGE_PROMPT = """아래는 여러 언론사 기사 제목에 붙인 사건 이름 목록입니다. 한 줄 형식: 번호|사건 이름|예시 제목
-제목을 나눠서 따로 이름을 붙였기 때문에, 같은 사건에 다른 이름이 붙어 있을 수 있습니다.
-같은 사건(같은 회사의 같은 발표 · 같은 정책 · 같은 지표 발표 · 같은 날 같은 시장 마감)을 가리키는 번호끼리 묶으세요.
-주제가 비슷해도 다른 회사 · 다른 발표 · 다른 날이면 묶지 마세요. 애매하면 묶지 마세요.
-두 개 이상 묶이는 것만 답하세요.
+제목을 나눠서 따로 이름을 붙였기 때문에, 같은 소식에 다른 이름이 붙어 있을 수 있습니다.
+같은 소식을 가리키는 번호끼리 묶으세요. 같은 소식이란:
+- 같은 회사 · 인물 · 기관의 같은 일(같은 발표 · 같은 정책 · 같은 지표 발표 · 같은 날 같은 시장 마감)
+- 그 일에 대한 직접 반응(주가 · 시장 · 업계 · 정치권 반응)과 후속 소식(조사 · 해명 · 영향 분석)
+  예: "A사 대표 복귀" · "A사 대표 복귀에 주가 급등" · "A사 대표 복귀로 업종 투자심리 회복" · "A사 대표 복귀에 의회 조사 착수"는 한 묶음입니다.
+묶지 않는 것: 주제만 비슷한 다른 회사 · 다른 발표, 같은 회사라도 서로 관계없는 다른 일(예: 실적 발표와 별개의 소송),
+다른 날 나온 같은 정기 지표(날마다 다른 사건).
+두 개 이상 묶이는 것만 답하세요. 묶음마다 소식 전체를 가장 잘 나타내는 이름의 번호를 맨 앞에 두세요.
 줄 끝에 (앞 실행)이 붙은 이름은 앞선 실행에서 이미 쓴 사건 이름입니다. 같은 사건이면 그 줄과 함께 묶으세요.
 
 JSON만 답하세요: {{"groups":[[번호,번호]]}}
@@ -135,8 +139,13 @@ EVENTS_PROMPT = """아래는 여러 언론사 기사에서 뽑은 사실 목록�
 한 사건 안에서는 같은 사실(다른 기사가 같은 내용 · 같은 숫자를 전한 것)끼리 한 묶음으로 넣으세요.
 facts는 묶음의 목록입니다. 예: [["사실id","사실id"],["사실id"]]. 내용이 조금이라도 다르면 다른 묶음입니다.
 사건마다 title을 새로 쓴 한 문장(40자 안팎)으로, cat을 아래 분류 코드 중 하나로 붙이세요. 분류: {cats}
+사건마다 scheduled와 surprise도 붙이세요.
+- scheduled: 미리 일정이 잡혀 있던 발표 · 결정 · 보고면 true(실적 발표 · 금통위 · FOMC · CPI · 고용 · 수출입 통계 등). 예고 없이 생긴 일이면 false.
+- surprise: scheduled가 true일 때만, 시장 예상 대비 결과. -2 훨씬 나쁨 · -1 나쁨 · 0 예상과 같음 · +1 좋음 · +2 훨씬 좋음.
+  사실 목록에 예상치([예상] 표시 숫자 · 컨센서스 · 전망치)가 없거나 scheduled가 false면 0. 예상치를 지어내지 마세요.
+  예: 영업이익 1조 2천억 원, 시장 전망 9천억 원 → +2.
 
-JSON만 답하세요: {{"events":[{{"title":"","cat":"코드","facts":[["사실id"]]}}]}}
+JSON만 답하세요: {{"events":[{{"title":"","cat":"코드","scheduled":false,"surprise":0,"facts":[["사실id"]]}}]}}
 
 사실 목록:
 {lines}
@@ -270,7 +279,7 @@ def merge_events(kept, stats, prev=None):
             continue
         for g in (out or {}).get("groups", []) if isinstance(out, dict) else []:
             try:
-                idx = sorted({int(i) for i in g if 0 <= int(i) < len(part)})
+                idx = list(dict.fromkeys(int(i) for i in g if 0 <= int(i) < len(part)))   # 모델 순서 (맨 앞 = 대표 이름)
             except (TypeError, ValueError):
                 continue
             if len(idx) < 2:
@@ -299,13 +308,51 @@ def _kst_iso(dt):
     return dt.astimezone(KST).isoformat(timespec="seconds") if dt else None
 
 
-def headline_items(kept, names, now, stocks=None):
-    """고르기를 통과한 제목 → headlines 항목. 본문 · 사실은 넣지 않는다 (요청-알파스코프-뉴스-글-발행 10 · 11절)."""
+def dedupe_titles(kept):
+    """21절 R25: 제목이 SAME_TITLE 이상 같은 기사는 하나만 (가장 먼저 나온 것). [(남긴 기사, [뺀 기사 id])]를 원래 순서로."""
+    order = sorted(range(len(kept)), key=lambda i: (kept[i].get("ts") or float("inf"), i))
+    heads, exact = [], {}                            # heads: [(원래 자리, 제목 키, 뺀 id 목록)]
+    sm = SequenceMatcher(autojunk=False)
+    for i in order:
+        key = _title_key(kept[i]["title"])
+        hit = exact.get(key) if key else None
+        if hit is None and key:
+            sm.set_seq2(key)
+            for h in heads:
+                if not h[1]:
+                    continue
+                sm.set_seq1(h[1])
+                if sm.real_quick_ratio() >= SAME_TITLE and sm.quick_ratio() >= SAME_TITLE and sm.ratio() >= SAME_TITLE:
+                    hit = h
+                    break
+        if hit is not None:
+            hit[2].append(kept[i]["id"])
+            continue
+        h = (i, key, [])
+        heads.append(h)
+        if key:
+            exact[key] = h
+    return [(kept[i], dropped) for i, _, dropped in sorted(heads, key=lambda h: h[0])]
+
+
+def headline_items(kept, names, now, stocks=None, stats=None):
+    """고르기를 통과한 제목 → headlines 항목. 본문 · 사실은 넣지 않는다 (요청-알파스코프-뉴스-글-발행 10 · 11절).
+    같은 제목은 하나만 넘기고, 뺀 기사에 붙은 종목은 남긴 기사로 옮긴다 (21절 R25)."""
     stocks = stocks or {}
-    return [{"title": html.unescape(c["title"]), "outlet": names.get(c["no"], ""), "url": c["url"],
-             "publishedAt": _kst_iso(datetime.fromtimestamp(c["ts"], timezone.utc)) if c.get("ts") else None,
-             "foundAt": _kst_iso(now), "event": c["event"], "cat": c.get("cat") or "", "stocks": stocks.get(c["id"], [])}
-            for c in kept]
+    rows = dedupe_titles(kept)
+    if stats is not None:
+        stats["headlinesDupDropped"] = len(kept) - len(rows)
+    out = []
+    for c, dropped in rows:
+        st = {}
+        for i in [c["id"]] + dropped:
+            for s in stocks.get(i, []):
+                st.setdefault(s["name"], s)
+        out.append({"title": html.unescape(c["title"]), "outlet": names.get(c["no"], ""), "url": c["url"],
+                    "publishedAt": _kst_iso(datetime.fromtimestamp(c["ts"], timezone.utc)) if c.get("ts") else None,
+                    "foundAt": _kst_iso(now), "event": c["event"], "cat": c.get("cat") or "",
+                    "stocks": list(st.values())[:5]})
+    return out
 
 
 def write_headlines(blog_db, run_id, items, now, light):
@@ -362,6 +409,7 @@ def blog_event(ev):
     sectors = Counter(f["sector"].strip() for f in ev["facts"] if f.get("sector", "").strip())
     return {"event": ev.get("event") or ev["title"], "cat": ev["cat"], "direction": ev["direction"], "stage": ev["stage"],
             "sourceCount": ev["sourceCount"], "outletCount": ev["outletCount"], "single": ev["single"],
+            "scheduled": bool(ev.get("scheduled")), "surprise": ev.get("surprise", 0),
             "stocks": [info[n] for n, _ in stocks.most_common(10)],
             "sector": sectors.most_common(1)[0][0] if sectors else "",
             "numbers": [{k: n[k] for k in ("name", "value", "unit", "kind", "sources", "agreed")} for n in ev["numbers"]],
@@ -595,6 +643,16 @@ def source_ids(items, same):
     return [find(i) for i in range(len(items))]
 
 
+def event_surprise(scheduled, surprise, facts):
+    """19절 R24: 예고된 발표(scheduled)이고 사실에 예상치 숫자(kind 예상)가 있을 때만 모델 값(-2 ~ +2), 아니면 0."""
+    if not scheduled or not any(n.get("kind") == "예상" for f in facts for n in f.get("numbers") or []):
+        return 0
+    try:
+        return max(-2, min(2, int(surprise)))
+    except (TypeError, ValueError):
+        return 0
+
+
 def build_events(arts, stats, same=None):
     """arts: [{id, no, url, title, publishedAt, facts}] → 사건 목록.
     확인 수(sourceCount)는 언론사 수가 아니라 독립 출처 수다 (source_ids). 숫자 일치도 독립 출처 두 곳 이상이어야 한다."""
@@ -606,7 +664,8 @@ def build_events(arts, stats, same=None):
                 continue
             fid = f"{a['id'][:10]}-{j}"
             fidx[fid] = (a, f)
-            nums = "; ".join(f"{n['name']} {n['value']}{n['unit']}" for n in f["numbers"])
+            nums = "; ".join(f"{n['name']} {n['value']}{n['unit']}" + ("[예상]" if n.get("kind") == "예상" else "")
+                             for n in f["numbers"])
             lines.append(f"{fid}|{a['no']:02d}|{f['cat']}|{f['what']}" + (f" ({nums})" if nums else ""))
     if not lines:
         return []
@@ -621,12 +680,12 @@ def build_events(arts, stats, same=None):
                 same_facts.append(g)
         if same_facts:
             groups.append((str(e.get("title") or "")[:120], e.get("cat") if e.get("cat") in CATEGORIES else "OTHER",
-                           same_facts))
+                           same_facts, e.get("scheduled") is True, e.get("surprise")))
     for fid in fidx:                                         # 모델이 빠뜨린 사실은 혼자 한 사건
         if fid not in used:
-            groups.append((fidx[fid][1]["what"][:120], fidx[fid][1]["cat"], [[fid]]))
+            groups.append((fidx[fid][1]["what"][:120], fidx[fid][1]["cat"], [[fid]], False, 0))
     events = []
-    for title, cat, same_facts in groups:
+    for title, cat, same_facts, scheduled, surprise in groups:
         ids = [x for g in same_facts for x in g]
         outlets = sorted({fidx[x][0]["no"] for x in ids})
         art_list = list({fidx[x][0]["id"]: fidx[x][0] for x in ids}.values())
@@ -663,6 +722,8 @@ def build_events(arts, stats, same=None):
             "direction": ("up" if dirs.count("up") > dirs.count("down") else
                           "down" if dirs.count("down") > dirs.count("up") else "neutral"),
             "stage": "discussing" if all(fidx[x][1]["stage"] == "discussing" for x in ids) else "confirmed",
+            "scheduled": scheduled,
+            "surprise": event_surprise(scheduled, surprise, [fidx[x][1] for x in ids]),
             "sources": list(sources.values()),
         })
     events.sort(key=lambda e: (-e["sourceCount"], -e["outletCount"], -len(e["facts"])))
@@ -727,9 +788,11 @@ def main():
         out_names = {o["no"]: o.get("name", "") for o in outlets}
         if blog_db is not None:
             try:
-                n = write_headlines(blog_db, run_id, headline_items(kept, out_names, now), now, LIGHT)
-                stats["headlines"] = len(kept)
-                log(f"   블로그 제목 묶음: {len(kept):,}건 → 문서 {n}개, 오래된 문서 {prune_headlines(blog_db, now)}개 지움")
+                items = headline_items(kept, out_names, now, stats=stats)
+                n = write_headlines(blog_db, run_id, items, now, LIGHT)
+                stats["headlines"] = len(items)
+                log(f"   블로그 제목 묶음: {len(items):,}건(같은 제목 {stats['headlinesDupDropped']}건 뺌) → 문서 {n}개, "
+                    f"오래된 문서 {prune_headlines(blog_db, now)}개 지움")
             except Exception as e:                        # 블로그 저장소가 안 돼도 수집은 이어 간다
                 log(f"   블로그 제목 묶음을 못 씀 ({type(e).__name__})")
         if LIGHT:                                         # 가벼운 회차: '이미 본 것'으로 남기지 않고 끝낸다
