@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
 import llm
+import names
 import net
 
 KST = timezone(timedelta(hours=9))
@@ -36,6 +37,7 @@ HEADLINES_DAYS = 30        # 이보다 오래된 headlines 문서는 지운다
 FACTS_DOC_BYTES = 900_000  # facts 문서 하나 크기 (Firestore 1MB 한도에 여유를 둠)
 CARRY_HOURS = 24           # 이 기간 실행들의 사건 이름을 이어 쓴다 (11절 Q13)
 LIGHT = os.environ.get("LIGHT") == "1"
+OUTLOOK_EXTRA = 10         # 시장 전망 기사를 본문 받기에 따로 더 넣을 수 (MAX_FETCH와 따로, 25절 Q25)
 PER_EVENT = 3              # 한 사건에서 본문을 받을 최대 언론사 수
 FACT_BATCH_N = 5           # 사실 뽑기 한 번에 넣을 기사 수
 FACT_BATCH_CHARS = 40_000  # 사실 뽑기 한 번에 넣을 본문 글자 수 (기사를 자르지 않고 묶음을 나눈다)
@@ -69,7 +71,8 @@ PICK_PROMPT = """아래는 국내 언론사 기사 제목 목록입니다. 한 �
 주식 투자 블로그의 사건별 글 재료로 쓸 기사만 고르세요.
 
 고르는 것: 국내 증시(코스피 · 코스닥)와 수급, 업종 · 산업 동향, 기업(실적 · 공시 · 투자 · 인수합병 · 신사업 · 소송),
-경제 정책 · 규제 · 세제, 환율 · 금리 · 물가 · 경기지표, 해외 사건 중 국내 시장이나 기업에 영향이 드러나는 것.
+경제 정책 · 규제 · 세제, 환율 · 금리 · 물가 · 경기지표, 해외 사건 중 국내 시장이나 기업에 영향이 드러나는 것,
+증권사 · 운용사 · 은행의 시장 전망(지수 밴드 · 목표 · 환율 · 금리 전망 · 업종 비중 의견 — 종목 추천 나열이 아니면 고르세요).
 빼는 것: 스포츠, 연예, 사건사고, 생활 · 건강, 시장 영향이 드러나지 않는 일반 정치, 인사 · 부고 · 동정, 행사 홍보,
 사진 · 영상 안내, 칼럼 · 사설 · 기자수첩, 종목 추천 나열, 광고성 기사. 애매하면 빼세요.
 
@@ -114,7 +117,10 @@ FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내�
 - 매수 · 매도를 권하는 말을 만들지 마세요.
 - quote.text는 기사에서 따옴표로 직접 인용한 말만, 따옴표 안 글자 그대로 옮기세요(이것만은 기사 글자 그대로). 다듬거나 간접 인용을 직접 인용으로 바꾸지 마세요.
   speaker는 기사에 적힌 이름(이름이 없으면 "업계 관계자"처럼 기사 표현 그대로), title은 직함, venue는 말한 자리(기자간담회 · 국회 · 실적 발표 · 인터뷰 등, 모르면 빈 값).
-- people은 그 사실(what · who · quote)에 나오는, 이름이 기사에 적힌 사람 전부입니다. name은 기사에 적힌 이름 그대로(성만 있으면 빈 값으로 넣지 말고 빼세요),
+- what · who에 한국 사람 이름은 대통령 · 국무총리 · 장관 · 국회의장 · 여야 당대표 · 한국은행 총재 · 금융위원장 · 금융감독원장 ·
+  공정거래위원장 · 국세청장 · 그룹 회장만 씁니다. 그 밖의 사람은 이름 없이 '현대모비스 기획팀 부장'처럼 소속 · 직함으로 씁니다.
+  외국 사람은 '엔비디아 젠슨 황 CEO'처럼 소속 · 이름 · 직함을 함께 씁니다. (quote.speaker와 people에는 이름을 그대로 적으세요.)
+- people은 그 사실에 관련된, 기사에 이름이 적힌 사람 전부입니다(what에 이름을 쓰지 않았어도 넣으세요). name은 기사에 적힌 이름 그대로(성만 있으면 빈 값으로 넣지 말고 빼세요),
   org는 소속 회사 · 기관, title은 직함, foreign은 외국 사람이면 true. 사람이 없으면 빈 배열.
 - 숫자는 기사에 적힌 값 그대로(단위 포함). 계산하거나 반올림하지 마세요.
 - when은 기사에 적힌 만큼만 씁니다. 연월만 있으면 YYYY-MM, 연도만 있으면 YYYY. 없는 월 · 일을 01로 채우지 마세요.
@@ -122,8 +128,20 @@ FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내�
 - 기사 하나에 사실 1 ~ 8개. 사실이 없는 기사(칼럼 · 목록 기사 등)는 facts를 빈 배열로.
 - cat은 다음 분류 코드 중 하나: {cats}
 
+outlooks — 사실과 따로, 투자회사가 낸 시장 전망 숫자 · 결론만 기사마다 뽑습니다(없으면 빈 배열):
+- 대상(target): 코스피 · 코스닥 · 원달러 · 기준금리 · 국고채3년 · 국고채10년 · 미국10년물 · 연준금리 중 하나, 또는 업종 비중이면 업종 이름.
+  지수는 연간 범위(밴드) · 연말 목표 · 다음 달 범위. 종목 목표가는 넣지 않습니다.
+- firm은 전망한 곳 이름(증권사 · 운용사 · 은행 · 해외 투자은행 · 리서치 회사). 사람 이름은 넣지 않습니다.
+  kind: 회사면 firm, 정부 · 한국은행 · 국제기구면 official, "전문가 n%가 ~" 같은 설문이면 survey.
+- 값이 하나면 value, 범위면 low · high. 기사에 적힌 숫자 그대로(쉼표는 있어도 됨, 계산 · 환산하지 않음). unit은 pt · 원 · % · 회 중 하나.
+- stance는 업종 비중만: 확대 · 중립 · 축소(최선호 · 탑픽은 확대).
+- horizon은 전망 기한이 끝나는 달 YYYY-MM(기사 게시일 기준: 내년 연간이면 다음 해 -12, 다음 달 범위면 그 달), period는 year · half · quarter · month.
+- revised: 앞 전망을 올렸으면 up, 내렸으면 down, 아니면 빈 값. scenario: 강세 · 기본 · 약세처럼 나뉘어 있으면 그 이름, 아니면 빈 값.
+- 기사에 없는 칸은 비웁니다. 지어내지 마세요.
+
 JSON만 답하세요:
-{{"articles":[{{"id":"기사 id","facts":[{{"what":"","who":"","when":"YYYY-MM-DD · YYYY-MM · YYYY 또는 빈 값",
+{{"articles":[{{"id":"기사 id","outlooks":[{{"firm":"","kind":"firm|official|survey","target":"","value":"","low":"","high":"",
+"unit":"","stance":"","horizon":"YYYY-MM","period":"year|half|quarter|month","revised":"","scenario":""}}],"facts":[{{"what":"","who":"","when":"YYYY-MM-DD · YYYY-MM · YYYY 또는 빈 값",
 "numbers":[{{"name":"","value":"","unit":"","kind":"발표|예상|기타"}}],
 "quote":{{"speaker":"","title":"","venue":"","text":""}} 또는 null,
 "people":[{{"name":"","org":"","title":"","foreign":false}}],
@@ -396,11 +414,15 @@ def blog_event(ev):
     for f in ev["facts"]:
         rows.setdefault(f.get("group", id(f)), []).append(f)
     facts = []
+    ppl = names.people(ev["facts"])                     # 사람 이름 규칙 (23절 알림 · 사용자 11-25: 사실 줄에도)
     for g in rows.values():                             # 같은 사실 묶음에서 한 줄: 확인된 발언 · 숫자가 많은 것
         f = max(g, key=lambda f: (bool(f.get("quote") and f["quote"].get("verified")), len(f["numbers"])))
-        facts.append({"what": f["what"], "who": f["who"], "when": f["when"],
+        what = names.scrub_text(f["what"], ppl)
+        if not what:                                    # 이름을 직함으로 못 바꾼 줄은 넘기지 않는다
+            continue
+        facts.append({"what": what, "who": names.scrub_text(f["who"], ppl) or "", "when": f["when"],
                       "numbers": [{k: n[k] for k in ("name", "value", "unit", "kind")} for n in f["numbers"]],
-                      "quote": _blog_quote(f.get("quote")), "stocks": f["stocks"], "sector": f["sector"],
+                      "quote": _blog_quote(names.scrub_quote(f.get("quote"), ppl)), "stocks": f["stocks"], "sector": f["sector"],
                       "cat": f["cat"], "direction": f["direction"], "stage": f["stage"], "origin": f["origin"],
                       "sources": f.get("sources", 1)})
     stocks, info = Counter(), {}
@@ -422,15 +444,7 @@ def blog_event(ev):
 def write_facts(blog_db, run_id, events, copied_dropped, now):
     """facts/{실행 번호}-{n}: 사건 전부, 문서 크기 FACTS_DOC_BYTES마다 나눈다 (버리지 않음)."""
     rows = [blog_event(e) for e in events if e["facts"]]
-    parts, cur, size = [], [], 0
-    for r in rows:
-        n = len(json.dumps(r, ensure_ascii=False).encode()) + 100
-        if cur and size + n > FACTS_DOC_BYTES:
-            parts.append(cur)
-            cur, size = [], 0
-        cur.append(r)
-        size += n
-    parts = parts + [cur] if cur or not parts else parts
+    parts = _parts(rows)
     batch = blog_db.batch()
     for n, chunk in enumerate(parts, 1):
         batch.set(blog_db.collection("facts").document(f"{run_id}-{n}"), {
@@ -575,9 +589,109 @@ def batches(items, texts):
         yield cur
 
 
+# ---------- 시장 전망 (25절 R32 ~ R35) ----------
+# 증권사 전망 기사는 대개 한 곳만 써서 본문 받기(여러 곳 사건 먼저)에서 빠진다. 제목으로 골라 OUTLOOK_EXTRA건을 따로 더 받는다.
+OUTLOOK_WORD = re.compile(r"전망|밴드|목표|비중\s?확대|비중\s?축소|최선호|탑픽|톱픽|상단|하단")
+OUTLOOK_FIRM = re.compile(r"증권|투자|자산운용|운용|은행|리서치|골드만|모건|JP|씨티|BofA|뱅크오브아메리카|노무라|UBS|HSBC|바클레이즈"
+                          r"|도이치|맥쿼리|CLSA|블랙록|피델리티|웰스파고")
+OUTLOOK_TARGETS = ["코스피", "코스닥", "원달러", "기준금리", "국고채3년", "국고채10년", "미국10년물", "연준금리"]
+OUTLOOK_ALIAS = {"원달러환율": "원달러", "원화": "원달러", "환율": "원달러", "국고채3년물": "국고채3년", "국고채10년물": "국고채10년",
+                 "미국채10년": "미국10년물", "미국채10년물": "미국10년물", "미국10년": "미국10년물", "미국국채10년물": "미국10년물",
+                 "연방기금금리": "연준금리", "미국기준금리": "연준금리", "한국은행기준금리": "기준금리", "한국기준금리": "기준금리"}
+
+
+def outlook_title(title):
+    return bool(OUTLOOK_WORD.search(title or "") and OUTLOOK_FIRM.search(title or ""))
+
+
+def pick_outlooks(kept, chosen, n):
+    """본문 받기에 못 든 전망 제목 중 가장 새 n건."""
+    have = {c["id"] for c in chosen}
+    cands = sorted((c for c in kept if c["id"] not in have and outlook_title(c["title"])), key=lambda c: -(c.get("ts") or 0))
+    return cands[:n]
+
+
+def _num_text(v):
+    v = re.sub(r"[\s,]", "", str(v or ""))
+    return v if re.fullmatch(r"-?\d+(?:\.\d+)?", v) else ""
+
+
+def _clean_outlook(o, body):
+    """R32 칸 정리 + R33 verified (숫자가 본문에 그대로 있나 — 쉼표 · 띄어쓰기 무시)."""
+    if not isinstance(o, dict) or not str(o.get("firm") or "").strip():
+        return None
+    t = re.sub(r"[\s·/\-]", "", str(o.get("target") or ""))
+    t = OUTLOOK_ALIAS.get(t, t)
+    stance = o.get("stance") if o.get("stance") in ("확대", "중립", "축소") else ""
+    if not t or (t not in OUTLOOK_TARGETS and not stance):      # 업종은 비중 의견이 있을 때만
+        return None
+    nums = {k: _num_text(o.get(k)) for k in ("value", "low", "high")}
+    if not any(nums.values()) and not stance:
+        return None
+    flat = re.sub(r"[\s,]", "", body or "")
+    if any(nums.values()):
+        ok = all(re.search(rf"(?<![\d.]){re.escape(v)}(?![\d])", flat) for v in nums.values() if v)
+    else:
+        ok = t in flat                                             # 숫자 없는 업종 비중: 업종 이름이 본문에 있나
+    return {"firm": str(o["firm"]).strip()[:40],
+            "kind": o.get("kind") if o.get("kind") in ("firm", "official", "survey") else "firm",
+            "target": t[:30], **nums,
+            "unit": o.get("unit") if o.get("unit") in ("pt", "원", "%", "회") else "",
+            "stance": stance,
+            "horizon": o.get("horizon") if re.fullmatch(r"\d{4}-\d{2}", str(o.get("horizon") or "")) else "",
+            "period": o.get("period") if o.get("period") in ("year", "half", "quarter", "month") else "",
+            "revised": o.get("revised") if o.get("revised") in ("up", "down") else "",
+            "scenario": str(o.get("scenario") or "").strip()[:20], "verified": ok}
+
+
+def build_outlooks(arts, same=None):
+    """지난 EVENT_HOURS 기사의 전망을 회사 · 대상 · 기한 · 값으로 묶고, 실은 독립 출처 수를 센다 (R34, ⑤와 같은 방식)."""
+    groups = {}
+    for a in arts:
+        for o in a.get("outlooks") or []:
+            k = (re.sub(r"\s|\(주\)|㈜", "", o["firm"]), o["target"], o["horizon"], o["value"], o["low"], o["high"],
+                 o["stance"], o["scenario"])
+            groups.setdefault(k, []).append((a, o))
+    items = []
+    for rows in groups.values():
+        art_list = list({a["id"]: a for a, _ in rows}.values())
+        src = source_ids([(a["no"], a.get("title", "")) for a in art_list], same or {})
+        pub = [a["publishedAt"] for a in art_list if a.get("publishedAt")]
+        o = next((o for _, o in rows if o["verified"]), rows[0][1])
+        items.append(dict(o, verified=any(x["verified"] for _, x in rows), sources=len(set(src)),
+                          published=min(pub).astimezone(KST).strftime("%Y-%m-%d") if pub else ""))
+    items.sort(key=lambda x: (x["target"], x["horizon"], x["firm"]))
+    return items
+
+
+def _parts(rows):
+    """FACTS_DOC_BYTES마다 나눈 목록 (버리지 않음, 비어도 한 묶음)."""
+    parts, cur, size = [], [], 0
+    for r in rows:
+        n = len(json.dumps(r, ensure_ascii=False).encode()) + 100
+        if cur and size + n > FACTS_DOC_BYTES:
+            parts.append(cur)
+            cur, size = [], 0
+        cur.append(r)
+        size += n
+    return parts + [cur] if cur or not parts else parts
+
+
+def write_outlooks(blog_db, run_id, items, now):
+    """outlooks/{실행 번호}-{n} (R34). 0건이어도 -1 문서는 쓴다."""
+    parts = _parts(items)
+    batch = blog_db.batch()
+    for n, chunk in enumerate(parts, 1):
+        batch.set(blog_db.collection("outlooks").document(f"{run_id}-{n}"), {
+            "run": str(run_id), "part": n, "parts": len(parts), "createdAt": now, "version": 1,
+            "count": len(chunk), "items": chunk})
+    batch.commit()
+    return len(parts)
+
+
 def extract_facts(chosen, texts, stats):
     have = [c for c in chosen if c["id"] in texts]
-    stats.update(facts=0, copiedFacts=0, factBatchesFailed=0, quotes=0, quotesUnverified=0)
+    stats.update(facts=0, copiedFacts=0, factBatchesFailed=0, quotes=0, quotesUnverified=0, outlooks=0, outlooksUnverified=0)
     for batch in batches(have, texts):
         parts = []
         for c in batch:
@@ -588,11 +702,16 @@ def extract_facts(chosen, texts, stats):
         except llm.LLMError:
             stats["factBatchesFailed"] += 1
             continue
-        got = {str(a.get("id")): a.get("facts") or [] for a in (out or {}).get("articles", [])
-               if isinstance(a, dict)} if isinstance(out, dict) else {}
+        rows = [a for a in (out or {}).get("articles", []) if isinstance(a, dict)] if isinstance(out, dict) else []
+        got = {str(a.get("id")): a.get("facts") or [] for a in rows}
+        outs = {str(a.get("id")): a.get("outlooks") or [] for a in rows}
         for c in batch:
             if c["id"] not in got:
                 continue
+            ols = [o for o in (_clean_outlook(x, texts[c["id"]]) for x in outs.get(c["id"], [])) if o][:20]
+            c["outlooks"] = ols
+            stats["outlooks"] += len(ols)
+            stats["outlooksUnverified"] += sum(1 for o in ols if not o["verified"])
             facts = []
             for f in got[c["id"]]:
                 f = _clean_fact(f)
@@ -788,9 +907,14 @@ def main():
             pairs.setdefault(norm_label(c["event"]), [c["event"], c["title"][:60]])
         db.collection("eventnames").document(str(run_id)).set({"createdAt": now, "light": LIGHT, "names": list(pairs.values())})
         chosen, multi = ([], 0) if LIGHT else choose(kept, MAX_FETCH, same)
+        extra = [] if LIGHT else pick_outlooks(kept, chosen, OUTLOOK_EXTRA)   # 시장 전망 기사 몫 (25절)
+        stats["outlookTitles"] = sum(1 for c in kept if outlook_title(c["title"]))
+        stats["outlookExtra"] = len(extra)
+        chosen = chosen + extra
         stats["chosen"], stats["multiGroups"] = len(chosen), multi
         log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개 "
-            f"(앞 실행 이름 이어 씀 {stats.get('eventNamesCarried', 0)}개), 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건")
+            f"(앞 실행 이름 이어 씀 {stats.get('eventNamesCarried', 0)}개), 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건 "
+            f"(전망 제목 {stats['outlookTitles']}건 중 따로 더함 {stats['outlookExtra']}건)")
         out_names = {o["no"]: o.get("name", "") for o in outlets}
         if blog_db is not None:
             try:
@@ -821,7 +945,8 @@ def main():
         stats["stage"] = "사실"
         extract_facts(chosen, texts, stats)
         log(f"④ 사실: 사실 {stats['facts']}개 (기사 문장과 겹친 줄 {stats['copiedFacts']}개, 실패한 묶음 {stats['factBatchesFailed']}개, "
-            f"발언 {stats['quotes']}개 중 본문에 없음 {stats['quotesUnverified']}개)")
+            f"발언 {stats['quotes']}개 중 본문에 없음 {stats['quotesUnverified']}개, "
+            f"전망 {stats['outlooks']}개 중 숫자가 본문에 없음 {stats['outlooksUnverified']}개)")
         if blog_db is not None and stats.get("headlines") is not None:   # 본문을 받은 기사에는 종목을 붙여 다시 쓴다
             stocks = {}
             for c in chosen:
@@ -841,6 +966,7 @@ def main():
                    "publishedAt": datetime.fromtimestamp(c["ts"], timezone.utc) if c["ts"] else None,
                    "foundAt": now, "run": str(run_id), "event": c["event"], "cat": c["cat"],
                    "fetch": c.get("fetch", {}), "facts": c.get("facts", []), "factCount": len(c.get("facts", [])),
+                   "outlooks": c.get("outlooks", []),
                    "model": ",".join(llm.MODELS)}
             if "facts" in c:
                 doc["extractedAt"] = now
@@ -865,6 +991,15 @@ def main():
                 log(f"   블로그 사건별 사실: 사건 {n}개 → 문서 {parts}개, 오래된 문서 {prune_headlines(blog_db, now, 'facts')}개 지움")
             except Exception as e:                        # 블로그 저장소가 안 돼도 수집은 이어 간다
                 log(f"   블로그 사건별 사실을 못 씀 ({type(e).__name__})")
+            try:                                          # 시장 전망 (25절 R34, 지난 EVENT_HOURS 기사로 출처를 센다)
+                items = build_outlooks(arts, same)
+                parts = write_outlooks(blog_db, run_id, items, now)
+                stats["blogOutlooks"] = len(items)
+                log(f"   블로그 시장 전망: {len(items)}건(본문 확인 {sum(1 for x in items if x['verified'])}건, "
+                    f"두 곳 이상 {sum(1 for x in items if x['sources'] >= 2)}건) → 문서 {parts}개, "
+                    f"오래된 문서 {prune_headlines(blog_db, now, 'outlooks')}개 지움")
+            except Exception as e:
+                log(f"   블로그 시장 전망을 못 씀 ({type(e).__name__})")
         stats["stage"] = "끝"
     except llm.LLMError as e:
         stats["llmError"] = str(e)
