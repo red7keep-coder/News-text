@@ -17,7 +17,7 @@ MODELS = [m.strip() for m in (os.environ.get("GEMINI_MODELS") or "gemini-3.5-fla
 GAP = 4.5               # 분당 15회 한도 → 4초 남짓 간격
 ATTEMPTS = 4
 TIMEOUT = 180
-stats = {"calls": 0, "byModel": {}, "errors": {}}
+stats = {"calls": 0, "byModel": {}, "errors": {}, "tokensIn": 0, "tokensOut": 0}   # 토큰: 답 받은 호출의 usageMetadata 합 (29절 Q27)
 _last = 0.0
 
 
@@ -77,6 +77,9 @@ def _call(model, prompt, max_out, gap=GAP, temperature=0):
         return r.status_code, "", ""
     try:
         data = r.json()
+        use = data.get("usageMetadata") or {}
+        stats["tokensIn"] += int(use.get("promptTokenCount") or 0)
+        stats["tokensOut"] += int(use.get("candidatesTokenCount") or 0) + int(use.get("thoughtsTokenCount") or 0)
         cand = data["candidates"][0]
         finish = str(cand.get("finishReason") or "")
         text = "".join(p.get("text", "") for p in cand.get("content", {}).get("parts", []))

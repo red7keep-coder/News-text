@@ -25,6 +25,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
+import links
 import llm
 import names
 
@@ -672,7 +673,23 @@ def to_blog(blog_db, doc_id, post, ev, today, now):
         "body": post["body"], "date": today.strftime("%Y-%m-%d"), "createdAt": now,
         "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
         "stocks": top_stocks(ev), "sector": top_sector(ev), "slug": slug, "version": BLOG_VERSION,
+        "event": links.event_name(ev),                  # 28절 R36: facts · headlines의 event와 같은 이름
     })
+    return slug
+
+
+def link_facts(db, blog_db, facts_run, events, now):
+    """28절 R37: 이번 실행 facts 문서의 사건마다 post(글 slug)를 다시 붙인다 — 방금 쓴 글까지. 붙인 사건 수."""
+    from google.cloud.firestore_v1.base_query import FieldFilter
+    got = links.assign(events, links.recent_posts(db, blog_db, now))
+    n = 0
+    for d in blog_db.collection("facts").where(filter=FieldFilter("run", "==", str(facts_run))).stream():
+        evs = d.to_dict().get("events", [])
+        new = [dict(e, post=got.get(e.get("event", ""), "")) for e in evs]
+        n += sum(1 for e in new if e["post"])
+        if new != evs:
+            d.reference.update({"events": new})
+    return n
 
 
 def main():
@@ -719,7 +736,7 @@ def main():
             "summary": post.get("summary", "") if post else "", "banner": post.get("banner", {}) if post else {},
             "summaryDropped": fact["summaryDropped"], "version": BLOG_VERSION,
             "issues": issues, "tries": tries, "models": used,
-            "eventTitle": ev["title"], "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
+            "eventTitle": ev["title"], "event": links.event_name(ev), "cat": ev.get("cat"), "direction": ev.get("direction"), "stage": ev.get("stage"),
             "sourceCount": ev.get("sourceCount"), "outlets": ev.get("outlets", []),
             "agreedNumbers": [n for n in ev.get("numbers", []) if n.get("agreed")],
             "sources": shown_sources(ev),
@@ -732,6 +749,11 @@ def main():
             except Exception as e:                          # 블로그 저장소가 안 돼도 수집기 글은 남는다
                 log(f"   블로그 저장소에 못 씀 ({type(e).__name__})")
         log(f"⑥ ⑦ {i + 1}편: {status} (시도 {tries}번, 걸린 것 {len(issues)}개, 사실 확인으로 지운 문장 {len(fact['removed'])}개)")
+    if blog_db is not None:
+        try:
+            log(f"   블로그 사건별 사실에 글 이어 붙임: 사건 {link_facts(db, blog_db, sets[0].id, es.get('events', []), now)}개")
+        except Exception as e:                              # 못 붙여도 글은 그대로 (블로그는 둘 다 싣는다)
+            log(f"   블로그 사건별 사실에 글을 못 이어 붙임 ({type(e).__name__})")
     log(f"⑧ 저장: 초안 {stats['ok']}편, 검사 실패 {stats['failed']}편, 건너뜀 {stats['skipped']}편, "
         f"블로그 저장소 {stats['blog']}편" + ("" if blog_db is not None else "(BLOG_PROJECT 없음)") + " · "
         f"Gemini 호출 {llm.stats['calls']}번 {llm.stats['byModel']}" + (f", 오류 {llm.stats['errors']}" if llm.stats["errors"] else ""))

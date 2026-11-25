@@ -22,6 +22,7 @@ from collections import Counter
 from datetime import datetime, timedelta, timezone
 from difflib import SequenceMatcher
 
+import links as links_mod
 import llm
 import names
 import net
@@ -364,6 +365,16 @@ def merge_events(kept, stats, prev=None):
 
 # ---------- 블로그 제목 묶음 ----------
 
+def tok_since(snap):
+    """snap 뒤로 쓴 토큰 → 로그 글자 (29절 Q27 실측용). snap = (입력, 출력)."""
+    i, o = llm.stats["tokensIn"] - snap[0], llm.stats["tokensOut"] - snap[1]
+    return f", 토큰 입력 {i:,} · 출력 {o:,}"
+
+
+def tok_snap():
+    return llm.stats["tokensIn"], llm.stats["tokensOut"]
+
+
 def _kst_iso(dt):
     return dt.astimezone(KST).isoformat(timespec="seconds") if dt else None
 
@@ -443,12 +454,23 @@ def _blog_quote(q):
     if not q:
         return None
     verified = bool(q.get("verified"))                  # 확인 전 저장된 발언은 확인 안 된 것으로
-    return {"speaker": q.get("speaker", ""), "title": q.get("title", ""), "venue": q.get("venue", ""),
+    speaker = ko(q.get("speaker"))                      # 이미 저장된 사실(지난 36시간)의 한자도 여기서 고친다 (29절)
+    return {"speaker": speaker, "title": ko(q.get("title")), "venue": ko(q.get("venue")),
             "text": q.get("text", "") if verified else "", "verified": verified,
-            "anonymous": bool(q.get("anonymous", ANON.search(q.get("speaker", ""))))}
+            "anonymous": bool(q.get("anonymous") or ANON.search(speaker))}
 
 
-def blog_event(ev):
+def _ko_fact(f):
+    """저장된 사실의 한자 섞임 고치기 (29절). 발언자가 익명 꼴이면 anonymous를 다시 붙인다."""
+    q = f.get("quote")
+    if q:
+        sp = ko(q.get("speaker"))
+        q = dict(q, speaker=sp, title=ko(q.get("title")), anonymous=bool(q.get("anonymous") or ANON.search(sp)))
+    return dict(f, what=ko(f.get("what")), who=ko(f.get("who")), quote=q)
+
+
+def blog_event(ev, post=""):
+    ev = dict(ev, facts=[_ko_fact(f) for f in ev["facts"]])
     rows = {}
     for f in ev["facts"]:
         rows.setdefault(f.get("group", id(f)), []).append(f)
@@ -477,12 +499,14 @@ def blog_event(ev):
             "stocks": [info[n] for n, _ in stocks.most_common(10)],
             "sector": sectors.most_common(1)[0][0] if sectors else "",
             "numbers": [{k: n[k] for k in ("name", "value", "unit", "kind", "sources", "agreed")} for n in ev["numbers"]],
-            "facts": facts}
+            "facts": facts, "post": post or ""}
 
 
-def write_facts(blog_db, run_id, events, copied_dropped, now):
-    """facts/{실행 번호}-{n}: 사건 전부, 문서 크기 FACTS_DOC_BYTES마다 나눈다 (버리지 않음)."""
-    rows = [blog_event(e) for e in events if e["facts"]]
+def write_facts(blog_db, run_id, events, copied_dropped, now, links=None):
+    """facts/{실행 번호}-{n}: 사건 전부, 문서 크기 FACTS_DOC_BYTES마다 나눈다 (버리지 않음).
+    links: {사건 이름: 글 slug} (28절 R37). 같은 실행의 글은 write.py가 쓴 뒤 다시 붙인다."""
+    links = links or {}
+    rows = [blog_event(e, links.get(links_mod.event_name(e), "")) for e in events if e["facts"]]
     parts = _parts(rows)
     batch = blog_db.batch()
     for n, chunk in enumerate(parts, 1):
@@ -562,6 +586,14 @@ def fetch_all(chosen, hosts, stats):
 
 # ---------- ④ 사실 ----------
 
+# 모델이 한글 사이에 한자를 섞어 쓰는 경우 (29절: '금감원 관계者' → 익명 검사를 빠져나감). 사실 칸만 고친다 — 발언 글자는 본문과 맞춰 보므로 그대로
+HANJA_KO = str.maketrans({"者": "자", "側": "측", "等": "등", "及": "및", "對": "대"})
+
+
+def ko(s):
+    return str(s or "").translate(HANJA_KO)
+
+
 def _clean_fact(f):
     if not isinstance(f, dict) or not str(f.get("what") or "").strip():
         return None
@@ -569,8 +601,8 @@ def _clean_fact(f):
     if q and (not q.get("text") or not q.get("speaker") or len(str(q["text"])) > 200):
         q = None
     if q:
-        q = {"speaker": str(q["speaker"]).strip()[:60], "title": str(q.get("title") or "").strip()[:60],
-             "venue": str(q.get("venue") or "").strip()[:40], "text": str(q["text"]).strip()}
+        q = {"speaker": ko(q["speaker"]).strip()[:60], "title": ko(q.get("title")).strip()[:60],
+             "venue": ko(q.get("venue")).strip()[:40], "text": str(q["text"]).strip()}
     nums = []
     for n in f.get("numbers") or []:
         if isinstance(n, dict) and str(n.get("value") or "").strip():
@@ -580,11 +612,11 @@ def _clean_fact(f):
     stocks = [{"name": str(s.get("name") or "")[:40],
                "code": s.get("code") if re.fullmatch(r"\d{6}", str(s.get("code") or "")) else ""}
               for s in (f.get("stocks") or []) if isinstance(s, dict) and s.get("name")]
-    people = [{"name": str(p["name"]).strip()[:40], "org": str(p.get("org") or "").strip()[:60],
-               "title": str(p.get("title") or "").strip()[:60], "foreign": p.get("foreign") is True}
+    people = [{"name": ko(p["name"]).strip()[:40], "org": ko(p.get("org")).strip()[:60],
+               "title": ko(p.get("title")).strip()[:60], "foreign": p.get("foreign") is True}
               for p in (f.get("people") or []) if isinstance(p, dict) and len(str(p.get("name") or "").strip()) >= 2][:8]
     return {
-        "what": str(f["what"]).strip()[:200], "who": str(f.get("who") or "")[:80], "when": str(f.get("when") or "")[:20],
+        "what": ko(f["what"]).strip()[:200], "who": ko(f.get("who"))[:80], "when": str(f.get("when") or "")[:20],
         "numbers": nums, "quote": q, "people": people, "stocks": stocks, "sector": str(f.get("sector") or "")[:40],
         "cat": f.get("cat") if f.get("cat") in CATEGORIES else "OTHER",
         "direction": f.get("direction") if f.get("direction") in ("up", "down", "neutral") else "neutral",
@@ -600,7 +632,7 @@ def copied(what, text, n=25):
 
 
 _QUOTE_MARKS = re.compile(r"[\s\"'“”‘’「」『』〈〉《》·.,…]")
-ANON = re.compile(r"관계자|업계|당국자|소식통|측근|핵심 ?인사|고위 ?인사|정통한|익명|한 인사|일각")
+ANON = re.compile(r"관계\s*[자者]|업계|당국자|소식통|측근|핵심 ?인사|고위 ?인사|정통한|익명|한 인사|일각")
 
 
 def quote_in(text, body):
@@ -936,6 +968,7 @@ def main():
 
         # ② 고르기 (지난 CARRY_HOURS 실행들의 사건 이름을 이어 쓴다)
         stats["stage"] = "고르기"
+        t2 = tok_snap()
         prev = []
         for d in db.collection("eventnames").where(
                 filter=FieldFilter("createdAt", ">=", now - timedelta(hours=CARRY_HOURS))).stream():
@@ -954,7 +987,7 @@ def main():
         log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개 "
             f"(앞 실행 이름 이어 씀 {stats.get('eventNamesCarried', 0)}개), 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건 "
             f"(전망 제목 {stats['outlookTitles']}건 중 따로 더함 {stats['outlookExtra']}건)"
-            + (f", 고르기 다시 물음 {stats['pickRetried']}번" if stats.get("pickRetried") else ""))
+            + (f", 고르기 다시 물음 {stats['pickRetried']}번" if stats.get("pickRetried") else "") + tok_since(t2))
         sizes = event_sizes(kept, stats)
         if sizes:
             log(sizes)
@@ -990,10 +1023,11 @@ def main():
 
         # ④ 사실
         stats["stage"] = "사실"
+        t4 = tok_snap()
         extract_facts(chosen, texts, stats)
         log(f"④ 사실: 사실 {stats['facts']}개 (기사 문장과 겹친 줄 {stats['copiedFacts']}개, 실패한 묶음 {stats['factBatchesFailed']}개, "
             f"발언 {stats['quotes']}개 중 본문에 없음 {stats['quotesUnverified']}개, "
-            f"전망 {stats['outlooks']}개 중 숫자가 본문에 없음 {stats['outlooksUnverified']}개)")
+            f"전망 {stats['outlooks']}개 중 숫자가 본문에 없음 {stats['outlooksUnverified']}개){tok_since(t4)}")
         if blog_db is not None and stats.get("headlines") is not None:   # 본문을 받은 기사에는 종목을 붙여 다시 쓴다
             stocks = {}
             for c in chosen:
@@ -1022,6 +1056,7 @@ def main():
 
         # ⑤ 사건 (지난 실행의 사실까지 함께)
         stats["stage"] = "사건"
+        t5 = tok_snap()
         since = now - timedelta(hours=EVENT_HOURS)
         arts = [dict(d.to_dict(), id=d.id) for d in
                 db.collection("articles").where(filter=FieldFilter("extractedAt", ">=", since)).stream()]
@@ -1030,12 +1065,15 @@ def main():
             "createdAt": now, "since": since, "articles": len(arts), "events": events,
             "edition": now.astimezone(KST).strftime("%Y-%m-%d %H시"),
         })
-        log(f"⑤ 사건: 기사 {len(arts)}건에서 사건 {stats.get('events', 0)}개, 두 곳 이상 {stats.get('multiEvents', 0)}개")
+        log(f"⑤ 사건: 기사 {len(arts)}건에서 사건 {stats.get('events', 0)}개, 두 곳 이상 {stats.get('multiEvents', 0)}개{tok_since(t5)}")
         if blog_db is not None:
             try:
-                n, parts = write_facts(blog_db, run_id, events, stats.get("copiedDropped", 0), now)
+                posts = links_mod.recent_posts(db, blog_db, now)        # 28절 R37: 지난 36시간 글
+                links = links_mod.assign(events, posts)
+                stats["factsLinked"] = len(links)
+                n, parts = write_facts(blog_db, run_id, events, stats.get("copiedDropped", 0), now, links)
                 stats["blogFacts"] = n
-                log(f"   블로그 사건별 사실: 사건 {n}개 → 문서 {parts}개, 오래된 문서 {prune_headlines(blog_db, now, 'facts')}개 지움")
+                log(f"   블로그 사건별 사실: 사건 {n}개(글 이어 붙임 {len(links)}개) → 문서 {parts}개, 오래된 문서 {prune_headlines(blog_db, now, 'facts')}개 지움")
             except Exception as e:                        # 블로그 저장소가 안 돼도 수집은 이어 간다
                 log(f"   블로그 사건별 사실을 못 씀 ({type(e).__name__})")
             try:                                          # 시장 전망 (25절 R34, 지난 EVENT_HOURS 기사로 출처를 센다)
@@ -1054,7 +1092,8 @@ def main():
         raise
     finally:
         stats["requests"] = net.stats["requests"]
-        stats["llm"] = {"calls": llm.stats["calls"], "byModel": llm.stats["byModel"], "errors": llm.stats["errors"]}
+        stats["llm"] = {"calls": llm.stats["calls"], "byModel": llm.stats["byModel"], "errors": llm.stats["errors"],
+                        "tokensIn": llm.stats["tokensIn"], "tokensOut": llm.stats["tokensOut"]}
         stats["startedAt"], stats["finishedAt"] = now, datetime.now(timezone.utc)
         run_ref.set(stats)
         log(f"사이트 요청 {net.stats['requests']}번, Gemini 호출 {llm.stats['calls']}번 {llm.stats['byModel']}"
