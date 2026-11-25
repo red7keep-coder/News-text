@@ -83,8 +83,14 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
   올해 연도와 이번 달은 쓰지 않습니다. 날짜는 처음 한 번, 그리고 날짜가 바뀔 때만 씁니다(19일 … 18일 뉴욕증시는 …).
   같은 날짜를 문장마다 다시 쓰지 않습니다. 같은 날짜는 본문에 두 번까지만 씁니다.
   '~ 기준으로 ~했습니다'는 '19일 기준 ~였습니다'처럼 줄여 씁니다.
-- 사람: 한국 사람은 '기관 · 부서 이름 직함' 순서로 씁니다. 예: '산업통상부 무역투자 강감찬 실장은' (O) / '강감찬 산업통상부 무역투자실장은' (X).
-  대통령 · 총리 · 이름난 기업 총수처럼 널리 알려진 사람이 아니면 이름을 굵게 하지 않습니다.
+- 사람: 한국 사람은 아래 세 부류만 이름을 씁니다. 이름을 쓸 때는 '기관 이름 직함' 순서입니다. 예: '산업통상부 강감찬 장관은'.
+    국가 요직: 대통령 · 국무총리 · 장관 · 국회의장 · 여야 당대표
+    경제 · 금융 수장: 한국은행 총재 · 금융위원장 · 금융감독원장 · 공정거래위원장 · 국세청장
+    대기업 총수: 그룹 회장
+  그 밖의 한국 사람(대표이사 · 임원 · 부장 · 국회의원 · 차관 · 연구원 등)은 이름을 쓰지 않고 '회사 · 기관 부서 직함'으로만 씁니다.
+    예: '현대모비스 기획팀 부장은' (O) / '현대모비스 이규석은' (X). 재료에 직함이 없으면 '현대모비스 측은'처럼 씁니다.
+  외국 사람은 '회사 · 기관 + 이름 + 직함'을 함께 씁니다. 예: '엔비디아 젠슨 황 CEO는'. 이름만 쓰지 않습니다.
+  사람 이름은 굵게 하지 않습니다.
 - 재료에 없는 배경 지식(지난 연도 · 날짜 · 역사 · 다른 사건)을 덧붙이지 않습니다. 알고 있는 사실이라도 재료에 없으면 쓰지 않습니다.
 - 사실만 씁니다. 전망 · 평가 · 비유 · 기자 해석을 더하지 않습니다(좋다 · 우려 · 기대감 · 호재 · 악재 같은 말 금지).
 - 매수 · 매도 · 추천 같은 투자 권유를 쓰지 않습니다.
@@ -350,8 +356,11 @@ def materials(ev, today=None):
             extra.append(f"때 : {day_word(f['when'], today)}")
         if f.get("stage") == "discussing":
             extra.append("아직 정해지지 않음")
-        if f.get("quote") and f["quote"].get("text"):
-            extra.append(f"발언 : {f['quote'].get('speaker', '')} \"{f['quote']['text']}\"")
+        q = f.get("quote") or {}
+        if q.get("text"):                                    # 직함 · 자리도 넘긴다: 이름을 빼고 직함으로 쓰게 (11-25)
+            who = " · ".join(f"{k} {(q.get(f) or '').strip()}" for k, f in (("말한 사람", "speaker"), ("직함", "title"),
+                                                                              ("자리", "venue")) if (q.get(f) or "").strip())
+            extra.append(f"발언 : {who} \"{q['text']}\"")
         facts.append(f"- {w}" + (f" ({' · '.join(extra)})" if extra else ""))
     agreed = [n for n in ev.get("numbers", []) if n.get("agreed")]
     single = [n for n in ev.get("numbers", []) if not n.get("agreed")]
@@ -361,6 +370,36 @@ def materials(ev, today=None):
     fact_text = " ".join(seen) + " " + " ".join(f.get("when") or "" for f in ev.get("facts", []))
     return ("\n".join(facts), "\n".join(map(line, agreed)) or "- 없음", "\n".join(map(line, single)) or "- 없음",
             ok_set, bad_set, fact_text)
+
+
+# 이름을 써도 되는 한국 사람의 직함 (사용자 11-25: 국가 요직 · 경제 · 금융 수장 · 대기업 총수만)
+VIP_TITLE = re.compile(r"대통령|총리|장관|국회의장|당\s?대표|대표최고위원|(?<!부)총재|금융위원장|금융감독원장|금감원장"
+                       r"|공정거래위원장|공정위원장|국세청장|그룹\s?회장|(?<![부명예])회장|총수")
+NOT_VIP = re.compile(r"협회|연합회|조합|학회|재단|단체|위원회 위원|부회장|명예회장|대행")
+KO_NAME = re.compile(r"[가-힣]{2,4}")
+
+
+def hidden_names(ev):
+    """글에 쓰면 안 되는 한국 사람 이름 {이름: 직함}. 발언자 중 한글 이름(2 ~ 4자)이고 직함이 세 부류가 아닌 사람."""
+    out = {}
+    for f in ev.get("facts", []):
+        q = f.get("quote") or {}
+        name, title = (q.get("speaker") or "").strip(), (q.get("title") or "").strip()
+        if not KO_NAME.fullmatch(name) or q.get("anonymous") or name in ("관계자", "대변인", "당국자", "소식통"):
+            continue
+        if VIP_TITLE.search(title) and not NOT_VIP.search(title):
+            continue
+        out.setdefault(name, title)
+    return out
+
+
+def name_issues(text, where, names):
+    """이름을 쓰면 안 되는 사람의 이름이 든 글 (11-25: '현대모비스 이규석이 …')."""
+    for name, title in names.items():
+        if name in text:
+            how = f"직함('{title}')으로" if title else "'회사 측은'처럼"
+            return [f"{where}에 '{name}'의 이름을 썼습니다. 이 사람은 이름을 쓰지 않습니다. 이름을 빼고 회사 · 부서 {how} 쓰세요"]
+    return []
 
 
 def num_issues(text, where, ok_set, bad_set, fact_text):
@@ -386,11 +425,12 @@ def num_issues(text, where, ok_set, bad_set, fact_text):
     return issues
 
 
-def summary_issue(summary, ok_set, bad_set, fact_text, today):
+def summary_issue(summary, ok_set, bad_set, fact_text, today, names=None):
     """맨 앞 요약이 쓸 수 없는 이유 (있으면 요약만 비운다 — 고쳐 쓰지 않음)."""
     if not summary:
         return ""
-    bad = num_issues(summary, "요약", ok_set, bad_set, fact_text) + (check_dates(summary, today) if today else [])
+    bad = (num_issues(summary, "요약", ok_set, bad_set, fact_text) + (check_dates(summary, today) if today else [])
+           + name_issues(summary, "요약", names or {}))
     for rx, msg in BANNED:
         if rx.search(summary):
             bad.append(msg)
@@ -416,8 +456,9 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
         issues.append(f"제목이 {len(title)}자입니다. {TITLE_MAX}자 이내로 줄이세요")
     if title.endswith("."):
         issues.append("제목 끝 마침표를 빼세요")
+    names = hidden_names(ev)
     for text, where in ((title, "제목"), (body, "본문")):
-        issues += num_issues(text, where, ok_set, bad_set, fact_text)
+        issues += num_issues(text, where, ok_set, bad_set, fact_text) + name_issues(text, where, names)
     sentences = [x.strip() for x in re.split(r"(?<=[.?!])\s+", body) if x.strip()]
     bad_end = [x for x in sentences if not x.endswith("니다.")]
     if bad_end:
@@ -552,7 +593,7 @@ def write_one(ev, today):
             break
     fact = {"removed": [], "model": "", "summaryDropped": ""}
     if post and not issues and post.get("summary"):           # 요약은 고쳐 쓰지 않는다: 걸리면 비우고 블로그가 대체한다 (12절)
-        why = summary_issue(post["summary"], ok_set, bad_set, fact_text, today)
+        why = summary_issue(post["summary"], ok_set, bad_set, fact_text, today, hidden_names(ev))
         if why:
             fact["summaryDropped"], post = why, dict(post, summary="")
     if post and not issues:                                   # ⑦-2 사실 확인: 다시 쓰지 않고 근거 없는 문장만 지운다
