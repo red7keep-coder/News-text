@@ -32,6 +32,8 @@ FRESH_HOURS = 36           # 이보다 오래된 목록 항목은 보지 않는�
 EVENT_HOURS = 36           # 사건 묶기에 넣을 사실의 기간
 SEEN_CAP = 5000            # 언론사마다 기억할 '이미 본 기사' 수
 TITLE_CHUNK = 1500         # 고르기 한 번에 넣을 제목 수
+PICK_EMPTY_MIN = 100       # 제목이 이만큼 넘는데 하나도 안 고르면 답이 잘못된 것으로 보고 다시 묻는다
+PICK_EMPTY_RETRY = 1
 HEADLINES_PER_DOC = 1500   # headlines 문서 하나에 담을 제목 수 (Firestore 문서 1MB 한도, 블로그 읽기 수를 줄이려고 몰아 담음)
 HEADLINES_DAYS = 30        # 이보다 오래된 headlines 문서는 지운다
 FACTS_DOC_BYTES = 900_000  # facts 문서 하나 크기 (Firestore 1MB 한도에 여유를 둠)
@@ -252,23 +254,60 @@ def _titles_from_pages(items, seen, fresh_after, n, notes):
 
 # ---------- ② 고르기 ----------
 
+def _pick_rows(chunk, out):
+    """고르기 답 → 후보 목록. {"keep":[...]}가 아니라 줄 목록만 와도 받는다."""
+    rows = out.get("keep", []) if isinstance(out, dict) else out if isinstance(out, list) else []
+    kept = []
+    for row in rows if isinstance(rows, list) else []:
+        try:
+            c = chunk[int(row["i"])]
+        except (KeyError, ValueError, TypeError, IndexError):
+            continue
+        kept.append(dict(c, event=str(row.get("event") or c["title"])[:80],
+                         cat=row.get("cat") if row.get("cat") in CATEGORIES else "OTHER"))
+    return kept
+
+
 def pick(cands, stats):
-    """고른 후보에 event · cat을 붙여 돌려준다."""
+    """고른 후보에 event · cat을 붙여 돌려준다.
+    11-25 07:00: 제목 1,238건에 형식만 맞고 고른 게 없는 답이 와서 오류 없이 0건으로 지나갔다.
+    제목이 PICK_EMPTY_MIN건 이상인데 0건이면 PICK_EMPTY_RETRY번 다시 묻고, 그래도 0건이면 경고를 남긴다."""
     kept = []
     for s in range(0, len(cands), TITLE_CHUNK):
         chunk = cands[s:s + TITLE_CHUNK]
         lines = "\n".join(f"{k}|{c['no']:02d}|{c['title']}" for k, c in enumerate(chunk))
-        out = llm.generate_json(PICK_PROMPT.format(cats=CAT_TEXT, lines=lines), max_out=32768)
-        for row in (out or {}).get("keep", []) if isinstance(out, dict) else []:
-            try:
-                c = chunk[int(row["i"])]
-            except (KeyError, ValueError, TypeError, IndexError):
-                continue
-            c = dict(c, event=str(row.get("event") or c["title"])[:80],
-                     cat=row.get("cat") if row.get("cat") in CATEGORIES else "OTHER")
-            kept.append(c)
+        prompt = PICK_PROMPT.format(cats=CAT_TEXT, lines=lines)
+        got = _pick_rows(chunk, llm.generate_json(prompt, max_out=32768))
+        for _ in range(PICK_EMPTY_RETRY):
+            if got or len(chunk) < PICK_EMPTY_MIN:
+                break
+            stats["pickRetried"] = stats.get("pickRetried", 0) + 1
+            got = _pick_rows(chunk, llm.generate_json(prompt, max_out=32768))
+        if not got and len(chunk) >= PICK_EMPTY_MIN:
+            stats["pickEmpty"] = stats.get("pickEmpty", 0) + 1
+            log(f"   경고: 고르기 답이 비었습니다 (제목 {len(chunk):,}건, 다시 물은 뒤에도 0건)")
+        kept += got
     stats["kept"] = len(kept)
     return kept
+
+
+def event_sizes(kept, stats):
+    """사건마다 제목 수 (21절 R26 확인용): 제목 1개짜리 사건 비율 · 가장 큰 사건.
+    11-25 15:30 가벼운 회차에서 이름 632개가 90개로 줄어 지나치게 합쳐졌는지 로그로 보려고 남긴다."""
+    sizes = {}
+    for c in kept:
+        k = norm_label(c["event"])
+        if k not in sizes:
+            sizes[k] = [c["event"], 0]
+        sizes[k][1] += 1
+    if not sizes:
+        return ""
+    single = sum(1 for _, n in sizes.values() if n == 1)
+    top = sorted(sizes.values(), key=lambda x: -x[1])[:3]
+    stats["eventSingle"], stats["eventCount"] = single, len(sizes)
+    stats["eventTop"] = [{"event": e, "titles": n} for e, n in top]
+    return (f"   사건 크기: 사건 {len(sizes)}개 중 제목 1개짜리 {single}개({single / len(sizes):.0%}), "
+            f"큰 사건 " + " · ".join(f"{e[:30]}({n})" for e, n in top))
 
 
 def merge_events(kept, stats, prev=None):
@@ -914,7 +953,11 @@ def main():
         stats["chosen"], stats["multiGroups"] = len(chosen), multi
         log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개 "
             f"(앞 실행 이름 이어 씀 {stats.get('eventNamesCarried', 0)}개), 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건 "
-            f"(전망 제목 {stats['outlookTitles']}건 중 따로 더함 {stats['outlookExtra']}건)")
+            f"(전망 제목 {stats['outlookTitles']}건 중 따로 더함 {stats['outlookExtra']}건)"
+            + (f", 고르기 다시 물음 {stats['pickRetried']}번" if stats.get("pickRetried") else ""))
+        sizes = event_sizes(kept, stats)
+        if sizes:
+            log(sizes)
         out_names = {o["no"]: o.get("name", "") for o in outlets}
         if blog_db is not None:
             try:
@@ -928,12 +971,16 @@ def main():
         if LIGHT:                                         # 가벼운 회차: '이미 본 것'으로 남기지 않고 끝낸다
             stats["stage"] = "끝(가벼운 회차)"
             return
-        # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게)
-        batch = db.batch()
-        for no, ids in new_ids.items():
-            seen = (states.get(no, {}).get("seen", []) + ids)[-SEEN_CAP:]
-            batch.set(db.collection("outlet_state").document(f"{no:02d}"), {"seen": seen, "lastRunAt": now})
-        batch.commit()
+        # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게).
+        # 고르기 답이 끝내 비었으면 남기지 않는다 — 다음 실행이 같은 제목을 다시 고르게 (11-25 07:00에 1,238건을 잃음)
+        if stats.get("pickEmpty"):
+            log("   고르기 답이 비어 이번 기사를 '이미 본 것'으로 남기지 않습니다 (다음 실행이 다시 고름)")
+        else:
+            batch = db.batch()
+            for no, ids in new_ids.items():
+                seen = (states.get(no, {}).get("seen", []) + ids)[-SEEN_CAP:]
+                batch.set(db.collection("outlet_state").document(f"{no:02d}"), {"seen": seen, "lastRunAt": now})
+            batch.commit()
 
         # ③ 받기
         stats["stage"] = "받기"
