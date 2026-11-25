@@ -8,9 +8,11 @@
 
 저장(Firestore, 비공개): articles · eventsets · runs · outlet_state · eventnames, outlets.feed
 블로그 저장소(BLOG_PROJECT, 블로그가 읽기만): headlines — 고르기를 통과한 제목 묶음(본문 없음, 문서당 1,500건). 30일 지나면 지운다
-  facts — 정기 회차 ⑤의 사건별 사실(언론사 · 주소 · 제목 없음, 문서당 900KB, 15절). 30일 지나면 지운다
-가벼운 회차(LIGHT=1, 평일 14:40 예약): ① 목록 · ② 고르기만 하고 headlines만 쓴다. '이미 본 것'으로 남기지 않는다
-  (그래야 16:30 회차가 같은 기사를 다시 골라 본문을 받는다 — 요청-알파스코프-뉴스-글-발행 11절 Q12)
+  facts — 정기 · 가벼운 회차 ⑤의 사건별 사실(언론사 · 주소 · 제목 없음, 문서당 900KB, 15절). 30일 지나면 지운다
+가벼운 회차(LIGHT=1, 평일 10:20 · 13:20 예약 → 블로그 12:20 · 15:20 받기 전에 끝남): ① 목록 · ② 고르기 · headlines, 그리고 31절 R39대로
+  제목으로 이미 2곳 이상이 다룬 사건만 LIGHT_FETCH건 ③ 받기 · ④ 사실 · ⑤ 사건 → facts (글쓰기 없음).
+  '이미 본 것'으로 남기지 않는다 (정기 회차 headlines · 사건 이름이 제목 전부를 보게 — 11절 Q12).
+  대신 이미 사실을 뽑은 기사는 어느 회차도 본문을 다시 받지 않는다 (31절 R41, articles에 있는 기사)
 공개 로그: 건수 · 글자 수 · 호출 수만. 언론사 이름 · 주소 · 제목 · 본문 · AI 입출력은 찍지 않는다.
 """
 import hashlib
@@ -41,6 +43,8 @@ FACTS_DOC_BYTES = 900_000  # facts 문서 하나 크기 (Firestore 1MB 한도에
 CARRY_HOURS = 24           # 이 기간 실행들의 사건 이름을 이어 쓴다 (11절 Q13)
 LIGHT = os.environ.get("LIGHT") == "1"
 OUTLOOK_EXTRA = 10         # 시장 전망 기사를 본문 받기에 따로 더 넣을 수 (MAX_FETCH와 따로, 25절 Q25)
+LIGHT_FETCH = 20           # 가벼운 회차에 본문을 받을 기사 수 (2곳 이상 사건만, 31절 R39)
+DONE_HOURS = 36            # 이 기간에 사실을 뽑은 기사는 본문을 다시 받지 않는다 (31절 R41)
 PER_EVENT = 3              # 한 사건에서 본문을 받을 최대 언론사 수
 FACT_BATCH_N = 5           # 사실 뽑기 한 번에 넣을 기사 수
 FACT_BATCH_CHARS = 40_000  # 사실 뽑기 한 번에 넣을 본문 글자 수 (기사를 자르지 않고 묶음을 나눈다)
@@ -517,8 +521,11 @@ def write_facts(blog_db, run_id, events, copied_dropped, now, links=None):
     return len(rows), len(parts)
 
 
-def choose(kept, limit, same=None):
-    """독립 출처 여러 곳이 다룬 사건부터, 사건마다 서로 다른 출처 PER_EVENT곳까지. 남으면 한 출처만 쓴 사건을 언론사 돌아가며."""
+def choose(kept, limit, same=None, multi_only=False, done=None):
+    """독립 출처 여러 곳이 다룬 사건부터, 사건마다 서로 다른 출처 PER_EVENT곳까지. 남으면 한 출처만 쓴 사건을 언론사 돌아가며.
+    multi_only: 2곳 이상 사건만 (가벼운 회차, 31절 R39).
+    done: 이미 사실을 뽑은 기사 id (31절 R41) — 출처 수에는 세지만 다시 받지 않고, 그만큼 그 사건 몫(PER_EVENT)에서 뺀다."""
+    done = done or set()
     groups = {}
     for c in kept:
         g = groups.setdefault(norm_label(c["event"]), {})
@@ -533,13 +540,16 @@ def choose(kept, limit, same=None):
     multi = sorted((k for k in groups if len(picks[k]) >= 2), key=lambda k: -len(picks[k]))
     chosen = []
     for k in multi:
-        for c in picks[k][:PER_EVENT]:
+        room = max(0, PER_EVENT - sum(1 for c in picks[k] if c["id"] in done))
+        for c in [c for c in picks[k] if c["id"] not in done][:room]:
             if len(chosen) >= limit:
                 return chosen, len(multi)
             chosen.append(c)
+    if multi_only:
+        return chosen, len(multi)
     singles = {}
     for k in groups:
-        if len(picks[k]) == 1:
+        if len(picks[k]) == 1 and picks[k][0]["id"] not in done:
             c = picks[k][0]
             singles.setdefault(c["no"], []).append(c)
     for v in singles.values():
@@ -978,15 +988,18 @@ def main():
         for c in kept:
             pairs.setdefault(norm_label(c["event"]), [c["event"], c["title"][:60]])
         db.collection("eventnames").document(str(run_id)).set({"createdAt": now, "light": LIGHT, "names": list(pairs.values())})
-        chosen, multi = ([], 0) if LIGHT else choose(kept, MAX_FETCH, same)
-        extra = [] if LIGHT else pick_outlooks(kept, chosen, OUTLOOK_EXTRA)   # 시장 전망 기사 몫 (25절)
+        done = {d.id for d in db.collection("articles").where(          # 31절 R41: 사실을 이미 뽑은 기사
+            filter=FieldFilter("extractedAt", ">=", now - timedelta(hours=DONE_HOURS))).select(["extractedAt"]).stream()}
+        stats["skippedDone"] = sum(1 for c in kept if c["id"] in done)
+        chosen, multi = choose(kept, LIGHT_FETCH if LIGHT else MAX_FETCH, same, multi_only=LIGHT, done=done)
+        extra = [] if LIGHT else pick_outlooks([c for c in kept if c["id"] not in done], chosen, OUTLOOK_EXTRA)   # 시장 전망 기사 몫 (25절)
         stats["outlookTitles"] = sum(1 for c in kept if outlook_title(c["title"]))
         stats["outlookExtra"] = len(extra)
         chosen = chosen + extra
         stats["chosen"], stats["multiGroups"] = len(chosen), multi
         log(f"② 고르기: {len(kept):,}건 남김, 사건 이름 {stats.get('eventNames', 0)}개 → 합쳐서 {stats.get('eventNamesMerged', 0)}개 "
             f"(앞 실행 이름 이어 씀 {stats.get('eventNamesCarried', 0)}개), 두 곳 이상이 다룬 사건 {multi}개 → 본문 받기 {len(chosen)}건 "
-            f"(전망 제목 {stats['outlookTitles']}건 중 따로 더함 {stats['outlookExtra']}건)"
+            f"(전망 제목 {stats['outlookTitles']}건 중 따로 더함 {stats['outlookExtra']}건, 이미 사실 뽑은 기사 {stats['skippedDone']}건 뺌)"
             + (f", 고르기 다시 물음 {stats['pickRetried']}번" if stats.get("pickRetried") else "") + tok_since(t2))
         sizes = event_sizes(kept, stats)
         if sizes:
@@ -1001,12 +1014,11 @@ def main():
                     f"오래된 문서 {prune_headlines(blog_db, now)}개 지움")
             except Exception as e:                        # 블로그 저장소가 안 돼도 수집은 이어 간다
                 log(f"   블로그 제목 묶음을 못 씀 ({type(e).__name__})")
-        if LIGHT:                                         # 가벼운 회차: '이미 본 것'으로 남기지 않고 끝낸다
-            stats["stage"] = "끝(가벼운 회차)"
-            return
         # 고르기까지 끝난 기사는 '이미 본 것'으로 남긴다 (다음 실행에서 제목을 다시 넣지 않게).
         # 고르기 답이 끝내 비었으면 남기지 않는다 — 다음 실행이 같은 제목을 다시 고르게 (11-25 07:00에 1,238건을 잃음)
-        if stats.get("pickEmpty"):
+        if LIGHT:                                         # 가벼운 회차: '이미 본 것'으로 남기지 않는다 (위 설명)
+            pass
+        elif stats.get("pickEmpty"):
             log("   고르기 답이 비어 이번 기사를 '이미 본 것'으로 남기지 않습니다 (다음 실행이 다시 고름)")
         else:
             batch = db.batch()
@@ -1096,7 +1108,8 @@ def main():
                         "tokensIn": llm.stats["tokensIn"], "tokensOut": llm.stats["tokensOut"]}
         stats["startedAt"], stats["finishedAt"] = now, datetime.now(timezone.utc)
         run_ref.set(stats)
-        log(f"사이트 요청 {net.stats['requests']}번, Gemini 호출 {llm.stats['calls']}번 {llm.stats['byModel']}"
+        log(f"끝난 시각 {datetime.now(KST):%H:%M} KST" + (" (가벼운 회차)" if LIGHT else "") + " · "
+            f"사이트 요청 {net.stats['requests']}번, Gemini 호출 {llm.stats['calls']}번 {llm.stats['byModel']}"
             + (f", 오류 {llm.stats['errors']}" if llm.stats["errors"] else ""))
 
 

@@ -1,11 +1,14 @@
 name: headlines
 
-# 가벼운 회차 (worker/collect.py, LIGHT=1): ① 목록 · ② 고르기만 하고, 고른 제목 묶음을 블로그 저장소 headlines에 쓴다.
-# 본문 받기 · 사실 · 글쓰기는 하지 않고, '이미 본 것'으로 남기지 않는다 (16:30 회차가 같은 기사의 본문을 받게).
-# 블로그 16:10 실행에 맞추려고 평일 14:40 KST 예약. GitHub 예약은 50 ~ 60분 늦게 시작해 보통 15:30 ~ 15:40에 끝난다.
+# 가벼운 회차 (worker/collect.py, LIGHT=1): ① 목록 · ② 고르기 · 제목 묶음(headlines), 그리고 2곳 이상이 다룬 사건만
+# 본문 20건 ③ 받기 · ④ 사실 · ⑤ 사건 → 블로그 저장소 facts (요청-알파스코프-뉴스-글-발행 31절 R38 · R39). 글쓰기는 하지 않는다.
+# 블로그가 평일 12:20 · 15:20 KST에 facts를 읽는다. 그 전에 끝나게 수집기가 일찍 돈다(사용자 11-26 "블로그는 그대로").
+# GitHub 예약은 50 ~ 65분(정기 회차는 85분까지) 늦게 시작하고, 가벼운 회차는 20 ~ 30분(503 많으면 +15분) 걸린다.
+# 그래서 10:20 · 13:20에 예약한다 → 보통 11:10 ~ 11:25 · 14:10 ~ 14:25에 시작해 11:30 ~ 11:50 · 14:30 ~ 14:50에 끝난다.
 on:
   schedule:
-    - cron: "40 5 * * 1-5"   # 평일 14:40 KST
+    - cron: "20 1 * * 1-5"   # 평일 10:20 KST 예약 → 블로그 12:20 받기 전에 끝나게
+    - cron: "20 4 * * 1-5"   # 평일 13:20 KST 예약 → 블로그 15:20 받기 전에 끝나게
   workflow_dispatch:
 
 concurrency:
@@ -19,7 +22,7 @@ permissions:
 jobs:
   headlines:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
 
@@ -36,7 +39,7 @@ jobs:
           workload_identity_provider: ${{ vars.WIF_PROVIDER }}
           service_account: ${{ vars.WIF_SERVICE_ACCOUNT }}
 
-      - name: 목록 · 고르기 · 제목 묶음
+      - name: 목록 · 고르기 · 제목 묶음 · 사실(2곳 이상 20건)
         working-directory: worker
         run: python collect.py
         env:
