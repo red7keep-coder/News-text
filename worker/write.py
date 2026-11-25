@@ -66,6 +66,9 @@ WRITE_PROMPT = """당신은 AlphaScope 블로그의 경제 뉴스 글을 씁니�
 재료 (사실, 괄호는 그 사실을 쓴 독립 출처 수):
 {facts}
 
+재료에 나오는 사람 (어떻게 쓸지, 아래 '사람' 규칙에 따라 정해 둠):
+{people}
+
 글에 쓸 수 있는 숫자 (독립 출처 두 곳 이상이 같은 값을 씀):
 {agreed}
 
@@ -379,26 +382,88 @@ NOT_VIP = re.compile(r"협회|연합회|조합|학회|재단|단체|위원회 �
 KO_NAME = re.compile(r"[가-힣]{2,4}")
 
 
-def hidden_names(ev):
-    """글에 쓰면 안 되는 한국 사람 이름 {이름: 직함}. 발언자 중 한글 이름(2 ~ 4자)이고 직함이 세 부류가 아닌 사람."""
+NOT_NAME = {"관계자", "대변인", "당국자", "소식통"}
+# 외국인 직함의 다른 표기: 글에 어느 쪽을 써도 직함을 쓴 것으로 본다
+TITLE_ALIAS = [("CEO", "최고경영자"), ("CFO", "최고재무책임자"), ("CTO", "최고기술책임자"), ("COO", "최고운영책임자"),
+               ("Chairman", "의장"), ("President", "대통령"), ("Governor", "총재")]
+
+
+def people(ev):
+    """사건에 나오는 사람 [{name, org, title, foreign}]. ④ people 칸(11-25부터)과 발언자를 합친다 (이름마다 하나)."""
     out = {}
     for f in ev.get("facts", []):
+        for p in f.get("people") or []:
+            name = (p.get("name") or "").strip()
+            if name and name not in NOT_NAME:
+                d = out.setdefault(name, {"name": name, "org": "", "title": "", "foreign": False})
+                d["org"], d["title"] = d["org"] or (p.get("org") or "").strip(), d["title"] or (p.get("title") or "").strip()
+                d["foreign"] = d["foreign"] or p.get("foreign") is True
         q = f.get("quote") or {}
-        name, title = (q.get("speaker") or "").strip(), (q.get("title") or "").strip()
-        if not KO_NAME.fullmatch(name) or q.get("anonymous") or name in ("관계자", "대변인", "당국자", "소식통"):
-            continue
-        if VIP_TITLE.search(title) and not NOT_VIP.search(title):
-            continue
-        out.setdefault(name, title)
-    return out
+        name = (q.get("speaker") or "").strip()
+        if name and name not in NOT_NAME and not q.get("anonymous"):
+            d = out.setdefault(name, {"name": name, "org": "", "title": "", "foreign": not KO_NAME.fullmatch(name)})
+            d["title"] = d["title"] or (q.get("title") or "").strip()
+    return list(out.values())
+
+
+def is_vip(p):
+    role = f"{p.get('org', '')} {p.get('title', '')}"
+    return bool(VIP_TITLE.search(role)) and not NOT_VIP.search(role)
+
+
+def hidden_names(ev):
+    """글에 쓰면 안 되는 한국 사람 이름 {이름: 소속 직함}. 한글 이름(띄어쓰기 빼고 2 ~ 4자)이고 세 부류가 아닌 사람."""
+    return {p["name"]: f"{p['org']} {p['title']}".strip() for p in people(ev)
+            if not p["foreign"] and KO_NAME.fullmatch(p["name"].replace(" ", "")) and not is_vip(p)}
 
 
 def name_issues(text, where, names):
     """이름을 쓰면 안 되는 사람의 이름이 든 글 (11-25: '현대모비스 이규석이 …')."""
-    for name, title in names.items():
+    for name, role in names.items():
         if name in text:
-            how = f"직함('{title}')으로" if title else "'회사 측은'처럼"
+            how = f"직함('{role}')으로" if role else "'회사 측은'처럼"
             return [f"{where}에 '{name}'의 이름을 썼습니다. 이 사람은 이름을 쓰지 않습니다. 이름을 빼고 회사 · 부서 {how} 쓰세요"]
+    return []
+
+
+def _has_title(sent, title):
+    if title in sent:
+        return True
+    for a, b in TITLE_ALIAS:
+        if (a in title or b in title) and (a in sent or b in sent):
+            return True
+    return False
+
+
+def people_lines(ev):
+    """글쓰기에 넘길 사람 줄: 사람마다 글에 쓸 꼴."""
+    rows = []
+    for p in people(ev):
+        role = " ".join(x for x in (p["org"], p["title"]) if x)
+        if p["foreign"]:
+            how = " ".join(x for x in (p["org"], p["name"], p["title"]) if x)
+            rows.append(f"- {p['name']} (외국) → '{how}'처럼 회사 · 이름 · 직함을 함께")
+        elif is_vip(p) or not KO_NAME.fullmatch(p["name"].replace(" ", "")):
+            rows.append(f"- {p['name']} ({role}) → 이름을 써도 됨")
+        else:
+            rows.append(f"- {p['name']} ({role or '직함 모름'}) → 이름을 쓰지 않음, 직함으로만: {role or '회사 측'}")
+    return "\n".join(rows) or "- 없음"
+
+
+def foreign_issues(text, where, ev):
+    """외국 사람을 처음 쓴 문장에 소속 · 직함이 없는 글 (11-25: '회사 + 이름 + 직함'). 소속 · 직함을 모르면 보지 않는다."""
+    sents = re.split(r"(?<=[.?!])\s+", text)
+    for p in people(ev):
+        if not p["foreign"]:
+            continue
+        first = next((s for s in sents if p["name"] in s), None)
+        if first is None:
+            continue
+        miss = [x for x, ok in (("소속", not p["org"] or p["org"] in first), ("직함", not p["title"] or _has_title(first, p["title"])))
+                if not ok]
+        if miss:
+            want = " ".join(x for x in (p["org"], p["name"], p["title"]) if x)
+            return [f"{where}에서 '{p['name']}'을 처음 쓴 문장에 {' · '.join(miss)}이 없습니다. '{want}'처럼 회사 · 이름 · 직함을 함께 쓰세요"]
     return []
 
 
@@ -459,6 +524,7 @@ def check(post, ev, ok_set, bad_set, fact_text, today=None):
     names = hidden_names(ev)
     for text, where in ((title, "제목"), (body, "본문")):
         issues += num_issues(text, where, ok_set, bad_set, fact_text) + name_issues(text, where, names)
+    issues += foreign_issues(body, "본문", ev)
     sentences = [x.strip() for x in re.split(r"(?<=[.?!])\s+", body) if x.strip()]
     bad_end = [x for x in sentences if not x.endswith("니다.")]
     if bad_end:
@@ -574,7 +640,7 @@ def write_one(ev, today):
     facts, agreed, single, ok_set, bad_set, fact_text = materials(ev, today)
     date = f"{today.year}년 {today.month}월 {today.day}일"
     base = dict(title=ev["title"], cat=CAT_KO.get(ev.get("cat"), "그 밖"), date=date, day=today.day,
-                facts=facts, agreed=agreed, single=single,
+                facts=facts, agreed=agreed, single=single, people=people_lines(ev),
                 min_chars=MIN_CHARS, max_chars=MAX_CHARS, title_max=TITLE_MAX)
     post, issues, tries, used = None, [], 0, []
     for tries in range(1, WRITE_TRIES + 1):

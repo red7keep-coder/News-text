@@ -114,6 +114,8 @@ FACTS_PROMPT = """아래 기사들에서 사실만 뽑으세요. 결과는 내�
 - 매수 · 매도를 권하는 말을 만들지 마세요.
 - quote.text는 기사에서 따옴표로 직접 인용한 말만, 따옴표 안 글자 그대로 옮기세요(이것만은 기사 글자 그대로). 다듬거나 간접 인용을 직접 인용으로 바꾸지 마세요.
   speaker는 기사에 적힌 이름(이름이 없으면 "업계 관계자"처럼 기사 표현 그대로), title은 직함, venue는 말한 자리(기자간담회 · 국회 · 실적 발표 · 인터뷰 등, 모르면 빈 값).
+- people은 그 사실(what · who · quote)에 나오는, 이름이 기사에 적힌 사람 전부입니다. name은 기사에 적힌 이름 그대로(성만 있으면 빈 값으로 넣지 말고 빼세요),
+  org는 소속 회사 · 기관, title은 직함, foreign은 외국 사람이면 true. 사람이 없으면 빈 배열.
 - 숫자는 기사에 적힌 값 그대로(단위 포함). 계산하거나 반올림하지 마세요.
 - when은 기사에 적힌 만큼만 씁니다. 연월만 있으면 YYYY-MM, 연도만 있으면 YYYY. 없는 월 · 일을 01로 채우지 마세요.
 - 숫자가 알맹이인 사실은 what에 숫자를 넣으세요. "자산총계 · 실적이 공개되었다"처럼 무엇이 나왔다는 말만 있는 문장은 쓰지 마세요.
@@ -124,6 +126,7 @@ JSON만 답하세요:
 {{"articles":[{{"id":"기사 id","facts":[{{"what":"","who":"","when":"YYYY-MM-DD · YYYY-MM · YYYY 또는 빈 값",
 "numbers":[{{"name":"","value":"","unit":"","kind":"발표|예상|기타"}}],
 "quote":{{"speaker":"","title":"","venue":"","text":""}} 또는 null,
+"people":[{{"name":"","org":"","title":"","foreign":false}}],
 "stocks":[{{"name":"","code":"6자리 종목코드 또는 빈 값"}}],
 "sector":"","cat":"코드","direction":"up|down|neutral","stage":"confirmed|discussing",
 "origin":"공시|보도자료|정부 발표|통계|없음"}}]}}]}}
@@ -524,9 +527,12 @@ def _clean_fact(f):
     stocks = [{"name": str(s.get("name") or "")[:40],
                "code": s.get("code") if re.fullmatch(r"\d{6}", str(s.get("code") or "")) else ""}
               for s in (f.get("stocks") or []) if isinstance(s, dict) and s.get("name")]
+    people = [{"name": str(p["name"]).strip()[:40], "org": str(p.get("org") or "").strip()[:60],
+               "title": str(p.get("title") or "").strip()[:60], "foreign": p.get("foreign") is True}
+              for p in (f.get("people") or []) if isinstance(p, dict) and len(str(p.get("name") or "").strip()) >= 2][:8]
     return {
         "what": str(f["what"]).strip()[:200], "who": str(f.get("who") or "")[:80], "when": str(f.get("when") or "")[:20],
-        "numbers": nums, "quote": q, "stocks": stocks, "sector": str(f.get("sector") or "")[:40],
+        "numbers": nums, "quote": q, "people": people, "stocks": stocks, "sector": str(f.get("sector") or "")[:40],
         "cat": f.get("cat") if f.get("cat") in CATEGORIES else "OTHER",
         "direction": f.get("direction") if f.get("direction") in ("up", "down", "neutral") else "neutral",
         "stage": f.get("stage") if f.get("stage") in ("confirmed", "discussing") else "confirmed",
